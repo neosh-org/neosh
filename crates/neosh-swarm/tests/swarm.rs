@@ -44,6 +44,10 @@ fn summary(id: &str, project: &str) -> AgentSummary {
         turn_started_at: Some(1000),
         updated_at: 1000,
         usage: Default::default(),
+        unread: false,
+        interrupted: false,
+        background: 0,
+        decorations: Vec::new(),
     }
 }
 
@@ -246,11 +250,11 @@ async fn a_command_reaches_the_machine_that_owns_the_agent() {
         node: b_id,
         id: "c1".into(),
         session: SessionId("s1".into()),
-        command: AgentCommand::Send { text: "carry on".into() },
+        command: AgentCommand::Send { text: "carry on".into(), images: Vec::new() },
     });
 
     let (id, text) = wait_for(&mut p.b_rx, |e| match e {
-        SwarmEvent::Command { id, command: AgentCommand::Send { text }, .. } => {
+        SwarmEvent::Command { id, command: AgentCommand::Send { text, .. }, .. } => {
             Some((id.clone(), text.clone()))
         }
         _ => None,
@@ -280,7 +284,7 @@ async fn a_read_only_node_refuses_without_asking_its_host() {
         node: b_id,
         id: "c1".into(),
         session: SessionId("s1".into()),
-        command: AgentCommand::Send { text: "do a thing".into() },
+        command: AgentCommand::Send { text: "do a thing".into(), images: Vec::new() },
     });
 
     // The owning host must never hear about it. Waiting for a couple of heartbeats is the only way
@@ -534,7 +538,7 @@ async fn a_subscriber_is_given_the_conversation_before_the_next_token() {
     // What a host does on being subscribed to: say what has been said.
     p.b.send(SwarmRequest::Stream {
         session: s1.clone(),
-        event: StreamEvent::History { messages: Vec::new() },
+        event: StreamEvent::History { messages: Vec::new(), live: None, interrupted: false },
     });
     p.b.send(SwarmRequest::Stream {
         session: s1.clone(),

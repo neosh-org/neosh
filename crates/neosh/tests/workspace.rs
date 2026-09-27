@@ -1295,7 +1295,7 @@ fn a_script_can_run_a_turn_with_nobody_watching() {
 
     s.call(neosh_proto::ApiCall::AgentCommand {
         session: Some(made.id.clone()),
-        command: neosh_proto::AgentCommand::Send { text: "say something".into() },
+        command: neosh_proto::AgentCommand::Send { text: "say something".into(), images: Vec::new() },
     });
 
     let want = made.id.clone();

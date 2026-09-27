@@ -396,6 +396,42 @@ is `docs/releasing.md`.
   either is a write to that disk, and the watcher checks before drawing a picker whose answer would
   be refused. A watcher with nobody to ask sends *nothing* — answering "nobody answered" for a
   person it never asked would be the worst answer available.
+- **A mirror says what the owner's screen says, so it is drawn live and rebuilt only when it
+  missed something.** Every turn's end used to rebuild the mirror from the history it brings, and a
+  rebuild is the messages and nothing else — the plan the turn closed with, what it changed, what
+  it left running and the card timings went back off the screen, and `redraw_transcript` kept the
+  old card rows, so `⇥` found the wrong card. A turn watched from its `TurnStarted` is drawn by the
+  path that drew it over there (`mirror_whole`), and the history its end brings is taken as data
+  and not drawn (`mirror_drawn`); a turn joined half way, or from a machine with no tool events,
+  is rebuilt, by `resync_transcript`, which leaves the scroll, the cursor and the draft alone.
+  **The history carries the turn in flight** — `StreamEvent::History { live: Some(LiveTurn) }`,
+  the owner's `Round::said` and plan — because an agent driver commits nothing until its loop is
+  over and a conversation opened mid-turn was the question and nothing under it. It carries
+  `interrupted`, and it is **cut to fit a frame** (`swarm::fit_history`): a frame over the cap is
+  the *link* failing, again on every reopen, so long outputs lose their middles, then the oldest
+  turns go whole. A link that drops puts the mirror's turn down (`drop_mirror_turns`) and the link
+  coming back resubscribes (`resubscribe_mirrors`), or the working line spun for ever over a
+  transcript that had stopped. A provider error over there is `StreamEvent::Notice`, said here with
+  the machine's name, and both new things are behind `NodeCapabilities::live`. **And a remote row
+  wears what the owner's row wears.** `AgentSummary` carries `unread`, `interrupted`, `background`
+  and a `Blocked` state stamped from `question.asking`/`permission.asking`; a watcher's
+  subscription counts as somebody reading, so a turn that ends in front of one is not unread and
+  opening a conversation from anywhere clears the mark everywhere. The git stats and the pull
+  request are the owner's `sidebar.decoration` contributions themselves, shipped as data on
+  `RemoteProject::decorations` and `AgentSummary::decorations` and merged by the watcher's panel
+  exactly as its own are — so `↓3 #86 ✗2` is a `git status` and a `gh` call on *that* disk with
+  *that* machine's credentials, and a third party's decoration crosses with nobody writing glue.
+  **Pictures cross too, both ways, as bytes and never as paths.** A path in the owner's transcript
+  is a file on the owner's disk, so drawn here it was the picture's *name*: the watcher asks for
+  each one it lacks (`AgentCommand::Picture`), the owner answers with `StreamEvent::Image` **only
+  for a picture that conversation's own transcript names** — anything else is refused, or a
+  watcher could read that disk through a conversation — and the copies live in the mirror's own
+  directory and go when it is let go. What you paste into a mirror goes on `AgentCommand::Send`'s
+  `images`, kept by the owner exactly as a paste there is, and `Asked::pictures` says where so the
+  question is drawn with it. **And a turn over there nobody watched is a notification here**
+  (`alert_remote_turns`, off the roster): running to idle and `unread` is precisely a turn nobody
+  saw end, and running to `Blocked` is one waiting for you — the owner raising them on its own
+  screen told a machine in a cupboard.
 - **A project is an identity, and a checkout is a machine and a path.** The panel grouped local
   conversations by directory and drew the other machines' work beside it — matched, in theory, on
   the project key, and in practice on a key the local side did not have: it was inferred from a

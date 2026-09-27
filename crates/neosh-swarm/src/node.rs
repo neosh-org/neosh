@@ -322,6 +322,7 @@ async fn run(
         // watched conversation a whole transcript.
         rich_stream: true,
         catalogue: true,
+        live: true,
         projects: Vec::new(),
     };
 
@@ -696,6 +697,9 @@ async fn run(
                         // link. It goes on getting the words, as it always did.
                         for p in peers.values() {
                             if event.is_rich() && !p.capabilities.rich_stream {
+                                continue;
+                            }
+                            if event.needs_live() && !p.capabilities.live {
                                 continue;
                             }
                             if p.watching.contains(&session) {
@@ -1230,6 +1234,10 @@ mod tests {
             turn_started_at: None,
             updated_at: 0,
             usage: Default::default(),
+            unread: false,
+            interrupted: false,
+            background: 0,
+            decorations: Vec::new(),
         }
     }
 

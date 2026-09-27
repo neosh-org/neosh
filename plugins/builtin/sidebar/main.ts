@@ -181,6 +181,12 @@ interface Checkout {
   agents: SwarmAgent[];
   /** How this checkout's fold is remembered. A local path, or `<node>:<path>`. */
   fold: string;
+  /**
+   * What the machine that owns it decorates its row with — `RemoteProject.decorations`, which is
+   * that machine's own `sidebar.decoration` contributions for this directory. Its git stats and its
+   * pull request, as *it* reads them.
+   */
+  decorations?: unknown[];
 }
 
 /**
@@ -246,6 +252,26 @@ function targetKey(t: Target | undefined): string | null {
   if (t.kind === "project") return `project:${t.cwd}`;
   if (t.kind === "session") return `session:${t.id}`;
   return null;
+}
+
+/**
+ * The marks another machine's panel wears on one of its rows, merged the way ours are.
+ *
+ * They arrive as that machine's own `sidebar.decoration` contributions — its git stats, its pull
+ * request, whatever a plugin over there says — so the row here says exactly what the row there
+ * says, and nothing on this machine has to know what any of it means.
+ */
+function carried(items: unknown[] | undefined): Decoration | undefined {
+  if (!items || items.length === 0) return undefined;
+  const merged = mergeDecorations(
+    items.map((item) => ({ item }) as Contribution & { item: DecorationItem }),
+  );
+  return merged.values().next().value;
+}
+
+/** A turn in flight over there — working, or stopped on a question it is waiting for you to answer. */
+function turning(a: AgentSummary): boolean {
+  return a.state === "running" || a.state === "blocked";
 }
 
 /**
@@ -3473,7 +3499,7 @@ async function showNodes(neosh: Neosh): Promise<void> {
     }
 
     for (const n of nodes) {
-      const running = n.agents.filter((a) => a.state === "running").length;
+      const running = n.agents.filter(turning).length;
       // One sentence per link state, because they are different answers to "why is it not here" —
       // and the fourth of them is the reason this reads the way it does. `waiting` is the far half
       // of pairing: reached, proven, and not yet allowed over there. It used to arrive as
@@ -3958,6 +3984,7 @@ function group(
       c.root = p.repo_root ?? undefined;
       c.branch = p.branch ?? undefined;
       c.head = p.head ?? undefined;
+      c.decorations = p.decorations ?? [];
       keyThere.set(c.fold, p.key);
       nameThere.set(c.fold, p.name);
     }
@@ -4393,7 +4420,7 @@ async function collect(
     .list({ includeArchived: true })
     .catch(() => [] as SessionInfo[]);
   const sessions = all.filter((s) => !s.archived);
-  const running = sessions.some((s) => s.active_turn);
+  let running = sessions.some((s) => s.active_turn);
   const now = Date.now();
 
   // What the other computers are running, and how each of them is reachable.
@@ -4409,6 +4436,9 @@ async function collect(
   const me = (await neosh.swarm.self().catch(() => null))?.id ?? null;
   const peers = (await neosh.swarm.nodes().catch(() => [] as SwarmNode[]))
     .filter((n) => n.info.id !== me);
+  // A turn over there has a clock on its row too, and a clock that moves every few seconds is one
+  // that looks stuck.
+  running ||= peers.some((n) => n.link.state === "up" && n.agents.some(turning));
 
   // Marks other plugins put on our rows. Read every frame for the reason sections are: a
   // decorator re-contributes in place when its data changes, and the read is one call.
@@ -4649,13 +4679,14 @@ function projectRow(
   const within = [...p.sessions, ...p.worktrees.flatMap((t) => t.sessions)];
   const outside = p.machines.flatMap(blockAgents);
   const busy = within.find((s) => s.active_turn);
-  const busyThere = outside.find((r) => r.agent.state === "running");
+  const busyThere = outside.find((r) => turning(r.agent));
   const here = p.sessions.some((s) => s.is_active);
   // Something in here has stopped and is waiting on an answer. It is still a turn in flight, so
   // `busy` finds it too — this is what decides which of the two the row says. Over everything
   // inside for the reason the count is: a question asked in a scratch tree of this repository is a
   // question in this repository, and folding is what hid the row that would otherwise say so.
-  const waiting = within.some((s) => opts.asking.has(s.id));
+  const waiting = within.some((s) => opts.asking.has(s.id)) ||
+    outside.some((r) => r.agent.state === "blocked");
   const total = within.length + outside.length;
 
   // The count is the useful thing when a project is folded, and the elapsed time is the useful
@@ -4666,7 +4697,7 @@ function projectRow(
     : busyThere?.agent.turn_started_at
     ? {
       text: `${elapsed(Math.max(0, now - busyThere.agent.turn_started_at * 1000))} `,
-      hl: "Status.Working",
+      hl: waiting ? "Status.Pending" : "Status.Working",
     }
     : total > 0
     ? { text: `${total} `, hl: "Sidebar.Dim" }
@@ -4729,11 +4760,14 @@ function projectRow(
   // Only one mark, because there is one column and two would be a puzzle rather than a summary.
   // A third thing the fold can be hiding, and it sits between the other two: a question stops the
   // workspace until you answer, a killed turn lost work, and an unread answer is waiting patiently.
+  // Over there as much as here: a repository is one row whichever machine the work is on.
   const cut = folded && !waiting
-    ? within.filter((s) => !s.active_turn && s.interrupted).length
+    ? within.filter((s) => !s.active_turn && s.interrupted).length +
+      outside.filter((r) => !turning(r.agent) && r.agent.interrupted).length
     : 0;
   const unseen = folded && !waiting && cut === 0
-    ? within.filter((s) => !s.active_turn && s.unread).length
+    ? within.filter((s) => !s.active_turn && s.unread).length +
+      outside.filter((r) => !turning(r.agent) && r.agent.unread).length
     : 0;
   // Fourth and last rung: a folded project hiding a conversation that is still running something.
   // Below all three, because a question stops the workspace, a killed turn lost work, an unread
@@ -4741,7 +4775,8 @@ function projectRow(
   // included, because folded is exactly the state where the rows that know are the ones you
   // cannot see.
   const busyBg = folded && !waiting && cut === 0 && unseen === 0
-    ? within.filter((s) => !s.active_turn && (s.background?.length ?? 0) > 0).length
+    ? within.filter((s) => !s.active_turn && (s.background?.length ?? 0) > 0).length +
+      outside.filter((r) => !turning(r.agent) && (r.agent.background ?? 0) > 0).length
     : 0;
   // Whichever rung is being reported, drawn the same way and told apart by the glyph and the
   // colour. One column, one mark — two would be a puzzle rather than a summary.
@@ -4784,8 +4819,13 @@ function projectRow(
   // The branch is the first thing to give way — it is context, and the name is the row.
   const branchFits = on !== "" && Array.from(p.name).length + width(on) <= room;
   const on_ = branchFits ? on : "";
+  // A repository only over there wears what that machine's panel puts on it — the machine whose
+  // section this is, or the one `↵` would reach.
+  const theirs = p.cwd === null
+    ? (p.machines.find((b) => b.node.id === under) ?? bestMachine(p, opts))?.main?.decorations
+    : undefined;
   const decoration = fitBadge(
-    opts.decorations.get(targetKey(target) ?? ""),
+    p.cwd === null ? carried(theirs) : opts.decorations.get(targetKey(target) ?? ""),
     room,
     Array.from(p.name).length,
   );
@@ -4860,24 +4900,32 @@ function treeRow(
   const folded = opts.folded(c.fold);
   const arrow = opts.ascii ? (folded ? ">" : "v") : folded ? "▸" : "▾";
   const busy = c.sessions.find((s) => s.active_turn);
-  const busyThere = c.agents.find((r) => r.agent.state === "running");
+  const busyThere = c.agents.find((r) => turning(r.agent));
   const here = c.sessions.some((s) => s.is_active);
   const total = c.sessions.length + c.agents.length;
+  const waiting = c.sessions.some((s) => opts.asking.has(s.id)) ||
+    c.agents.some((r) => r.agent.state === "blocked");
   const right = busy
-    ? { text: `${turnFor(busy, now)} `, hl: "Status.Working" }
+    ? { text: `${turnFor(busy, now)} `, hl: waiting ? "Status.Pending" : "Status.Working" }
     : busyThere?.agent.turn_started_at
     ? {
       text: `${elapsed(Math.max(0, now - busyThere.agent.turn_started_at * 1000))} `,
-      hl: "Status.Working",
+      hl: waiting ? "Status.Pending" : "Status.Working",
     }
     : total > 0
     ? { text: `${total} `, hl: "Sidebar.Dim" }
     : { text: "" };
-  const cut = folded ? c.sessions.filter((s) => !s.active_turn && s.interrupted).length : 0;
-  const unseen = folded && cut === 0
-    ? c.sessions.filter((s) => !s.active_turn && s.unread).length
+  const cut = folded && !waiting
+    ? c.sessions.filter((s) => !s.active_turn && s.interrupted).length +
+      c.agents.filter((r) => !turning(r.agent) && r.agent.interrupted).length
     : 0;
-  const mark = cut > 0
+  const unseen = folded && !waiting && cut === 0
+    ? c.sessions.filter((s) => !s.active_turn && s.unread).length +
+      c.agents.filter((r) => !turning(r.agent) && r.agent.unread).length
+    : 0;
+  const mark = folded && waiting
+    ? " ?"
+    : cut > 0
     ? cut === 1
       ? opts.ascii ? " x" : " ✗"
       : opts.ascii ? ` x${cut}` : ` ✗${cut}`
@@ -4908,7 +4956,7 @@ function treeRow(
   const room = opts.width - 8 - (width(pad) - 3) - byteLength(glyph) - byteLength(mark) -
     (sky ? 1 + width(sky.text) : 0);
   const decoration = fitBadge(
-    opts.decorations.get(targetKey(target) ?? ""),
+    c.node ? carried(c.decorations) : opts.decorations.get(targetKey(target) ?? ""),
     room,
     Array.from(label).length,
   );
@@ -4923,7 +4971,7 @@ function treeRow(
     spans.push({
       from: at,
       to: at + byteLength(mark),
-      hl: cut > 0 ? "Diagnostic.Error" : "Status.Unread",
+      hl: folded && waiting ? "Status.Pending" : cut > 0 ? "Diagnostic.Error" : "Status.Unread",
     });
   }
   const sky_ = sky ? ` ${sky.text}` : "";
@@ -5031,15 +5079,36 @@ function machineRow(b: MachineBlock, opts: DrawOptions, now: number): ListRow<Ta
   const code = marker(link, opts.codes.get(b.node.id), 0, opts.colors.get(b.node.id));
   const railHl = railOf(b.node.id, opts);
   const agents = blockAgents(b);
-  const busy = agents.find((r) => r.agent.state === "running");
+  const busy = agents.find((r) => turning(r.agent));
+  const waiting = up && agents.some((r) => r.agent.state === "blocked");
   const right = busy?.agent.turn_started_at
     ? {
       text: `${elapsed(Math.max(0, now - busy.agent.turn_started_at * 1000))} `,
-      hl: "Status.Working",
+      hl: waiting ? "Status.Pending" : "Status.Working",
     }
     : agents.length > 0
     ? { text: `${agents.length} `, hl: "Sidebar.Dim" }
     : { text: "" };
+  // What folding the block hid, as a project row says it: a question, then a turn that was cut
+  // off, then an answer nobody has read.
+  const settled = agents.filter((r) => !turning(r.agent));
+  const cut = folded && up && !waiting ? settled.filter((r) => r.agent.interrupted).length : 0;
+  const unseen = folded && up && !waiting && cut === 0
+    ? settled.filter((r) => r.agent.unread).length
+    : 0;
+  const [count, dot, dotHl] = cut > 0
+    ? [cut, opts.ascii ? "x" : "✗", "Diagnostic.Error"]
+    : [unseen, opts.ascii ? "!" : "●", "Status.Unread"];
+  const mark = folded && waiting
+    ? " ?"
+    : count === 0
+    ? ""
+    : count === 1
+    ? ` ${dot}`
+    : ` ${dot}${count}`;
+  const markHl = folded && waiting ? "Status.Pending" : dotHl;
+  // Its main checkout's marks, as that machine's panel draws them on the row for it.
+  const decoration = carried(b.main?.decorations);
   // Named by its branch when it said one. Its directory's name is not a branch, and put where a
   // branch goes it read as one — `⎇ neosh` for a checkout nobody had asked the branch of.
   const branch = b.main?.branch;
@@ -5052,12 +5121,17 @@ function machineRow(b: MachineBlock, opts: DrawOptions, now: number): ListRow<Ta
   const head = `${lead}${code.text} ${glyph}`;
   const room = Math.max(
     6,
-    opts.width - width(head) - width(commit) - (right.text === "" ? 1 : width(right.text) + 1),
+    opts.width - width(head) - width(commit) - width(mark) -
+      (right.text === "" ? 1 : width(right.text) + 1),
   );
-  const name = clip(what, room);
+  const fitted = fitBadge(decoration, room, Array.from(what).length);
+  const name = clip(what, Math.max(6, room - badgeColumns(fitted)));
   // The machine's own name, when it is not already the label and there is room for all of it.
-  const left = room - width(name);
-  const named = branch && left >= width(b.node.name) + 2 ? `  ${b.node.name}` : "";
+  // Not beside a badge: the badge is about the branch, and goes directly after it.
+  const left = room - width(name) - badgeColumns(fitted);
+  const named = branch && !fitted?.badge && left >= width(b.node.name) + 2
+    ? `  ${b.node.name}`
+    : "";
   const spans: Array<{ from: number; to: number; hl: string }> = [];
   let at = byteLength(lead);
   spans.push({ from: at, to: at + byteLength(code.text), hl: code.hl });
@@ -5068,9 +5142,13 @@ function machineRow(b: MachineBlock, opts: DrawOptions, now: number): ListRow<Ta
     spans.push({ from: at, to: at + byteLength(commit), hl: "Swarm.Version" });
     at += byteLength(commit);
   }
+  if (mark !== "") {
+    spans.push({ from: at, to: at + byteLength(mark), hl: markHl });
+    at += byteLength(mark);
+  }
   if (named !== "") spans.push({ from: at, to: at + byteLength(named), hl: "Sidebar.Dim" });
-  return {
-    text: `${head}${name}${commit}${named}`,
+  return decorateRow({
+    text: `${head}${name}${commit}${mark}${named}`,
     full: `${head}${what}${commit}  ${b.node.name}`,
     indent: byteLength(lead),
     hl: up ? undefined : "Sidebar.Remote",
@@ -5083,7 +5161,7 @@ function machineRow(b: MachineBlock, opts: DrawOptions, now: number): ListRow<Ta
       machines: [{ id: b.node.id, name: b.node.name, cwd: (b.main ?? b.trees[0])?.cwd ?? "" }],
       link: linkWords(link),
     },
-  };
+  }, fitted, Boolean(busy));
 }
 
 /** Every conversation in a machine's block: its main checkout's, then its worktrees'. */
@@ -5202,8 +5280,18 @@ function remoteRow(
   /** The machine's rail, when the row is under something that already says which machine. */
   rail?: Rail,
 ): ListRow<Target> {
-  const working = r.agent.state === "running";
   const link = opts.links.get(r.node.id);
+  // Every state a conversation of yours can be in, in the order `sessionRow` ranks them, off what
+  // the machine it is on says about it: asking you something, working, cut off, finished while
+  // nobody was looking, still running something in the background. Only while the link is up —
+  // a machine that cannot be reached is one whose marks are about a moment that has passed.
+  const up = link?.state === "up";
+  const asking = up && r.agent.state === "blocked";
+  const working = !asking && r.agent.state === "running";
+  const interrupted = up && !working && !asking && Boolean(r.agent.interrupted);
+  const unread = up && !working && !asking && !interrupted && Boolean(r.agent.unread);
+  const background = up && !working && !asking && !interrupted && !unread &&
+    (r.agent.background ?? 0) > 0;
   // The one you are in, over there. Lit like a conversation of yours you are in: the same `▸`, the
   // same colour, the whole title.
   const here = opts.mirrored?.node === r.node.id && opts.mirrored.session === r.agent.session;
@@ -5212,35 +5300,47 @@ function remoteRow(
     : marker(link, opts.codes.get(r.node.id), 0, opts.colors.get(r.node.id));
   // The state glyph a local conversation carries, in the same column it carries it in, so a
   // project's conversations read as one list whichever machine each of them is on.
-  const glyph = working
+  const glyph = asking
+    ? "?"
+    : working
     ? (here ? spinnerFrame() : opts.ascii ? "*" : "◍")
+    : interrupted
+    ? (opts.ascii ? "x" : "✗")
+    : unread
+    ? (opts.ascii ? "!" : "●")
+    : background
+    ? (opts.ascii ? "o" : "○")
     : here
     ? (opts.ascii ? ">" : "▸")
     : opts.ascii ? "." : "·";
+  // Anything that says more than *here* or *idle* outranks the machine's colour on the mark.
+  const stated = asking || working || interrupted || unread || background;
   const pad = indentFor(depth, rail);
   const lead = `${pad}${glyph} `;
   // The same clock a local row uses, in the same column: how long the turn that is running has
   // been running — `ago` is for "last touched" and rounds a whole minute away, which on a turn that
   // has been going twenty seconds reads as `now` for ever — and otherwise when it last moved, like
   // a conversation here: a list where only some rows say how old they are looks half-drawn.
-  const age = working && r.agent.turn_started_at
+  const age = (working || asking) && r.agent.turn_started_at
     ? elapsed(Math.max(0, now - r.agent.turn_started_at * 1000))
     : r.agent.updated_at > 0
     ? ago(now / 1000 - r.agent.updated_at)
     : "";
   const tail = mark.text === "" ? "" : ` ${mark.text}`;
+  const decoration = carried(r.agent.decorations);
   // Counted rather than guessed, as `sessionRow` does: the lead, the code after the title, and the
   // age column with a column of air either side of it.
   const room = Math.max(
     8,
-    opts.width - width(lead) - width(tail) - (age === "" ? 1 : width(age) + 2),
+    opts.width - width(lead) - width(tail) - (age === "" ? 1 : width(age) + 2) -
+      badgeColumns(decoration),
   );
   const label = clip(r.agent.label, room);
   const spans = [...railSpan(pad, rail)];
   // Under something that already named the machine, the conversation's own mark wears its colour —
   // the one column every conversation row has, so a block reads as one machine's without a line
   // drawn down beside it. Not while it is working: then the mark is the working colour's.
-  if (rail && !working && !here) {
+  if (rail && !stated && !here) {
     const from = byteLength(pad);
     spans.push({ from, to: from + byteLength(glyph), hl: rail.hl });
   }
@@ -5251,20 +5351,41 @@ function remoteRow(
       hl: mark.hl,
     });
   }
-  return {
+  return decorateRow({
     text: `${lead}${label}${tail}`,
     full: `${lead}${r.agent.label}${tail}`,
     indent: byteLength(lead),
     expand: here,
-    hl: here
+    hl: asking
+      ? "Status.Pending"
+      : here
       ? working && pulseBright() ? "Status.Working" : "Accent"
       : working
       ? "Status.Monitoring"
-      : link?.state === "up"
+      : interrupted
+      ? "Diagnostic.Error"
+      : unread
+      ? "Status.Unread"
+      : background
+      ? "Status.Monitoring"
+      : up
       ? undefined
       : "Sidebar.Remote",
     spans: spans.length > 0 ? spans : undefined,
-    right: { text: age === "" ? "" : `${age} `, hl: working ? "Status.Working" : "Sidebar.Dim" },
+    right: {
+      text: age === "" ? "" : `${age} `,
+      hl: asking
+        ? "Status.Pending"
+        : working
+        ? "Status.Working"
+        : interrupted
+        ? "Diagnostic.Error"
+        : unread
+        ? "Status.Unread"
+        : background
+        ? "Status.Monitoring"
+        : "Sidebar.Dim",
+    },
     value: {
       kind: "remote",
       node: r.node.id,
@@ -5273,7 +5394,7 @@ function remoteRow(
       host: r.node.name,
       link: linkWords(link),
     },
-  };
+  }, decoration, working || asking);
 }
 
 function sessionRow(

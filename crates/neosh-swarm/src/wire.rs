@@ -87,6 +87,7 @@ mod tests {
                 browse: true,
                 rich_stream: true,
                 catalogue: true,
+                live: true,
                 projects: Vec::new(),
             },
             nonce: "00".into(),

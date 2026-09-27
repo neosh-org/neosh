@@ -131,6 +131,9 @@ import type { NodeInfo } from "./generated/NodeInfo";
 import type { ProjectKey } from "./generated/ProjectKey";
 import type { RemoteProject } from "./generated/RemoteProject";
 import type { StreamEvent } from "./generated/StreamEvent";
+import type { LiveSaid } from "./generated/LiveSaid";
+import type { LiveTurn } from "./generated/LiveTurn";
+import type { ImageData } from "./generated/ImageData";
 import type { SwarmAgent } from "./generated/SwarmAgent";
 import type { SwarmNode } from "./generated/SwarmNode";
 import type { SwarmStranger } from "./generated/SwarmStranger";
@@ -163,7 +166,7 @@ export type {
   UsageBucket, UsageHistory, UsageResolution, UsageScanSource,
   Rect, RepoInfo, GitHead, RepoStatus, ScrollAmount, SelectShape, SessionId, SessionInfo, StatusAlign, StatusSegment, StopReason,
   SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage, ImageFile,
-  NodeCapabilities, NodeId, NodeInfo, ProjectKey, RemoteProject, StreamEvent,
+  NodeCapabilities, NodeId, NodeInfo, ProjectKey, RemoteProject, StreamEvent, LiveSaid, LiveTurn, ImageData,
   LinkState, SwarmAgent, SwarmNode, SwarmStranger,
   VarScope, ViewId, ViewInfo, Viewport,
   WindowId, WindowInfo, WindowLayout,

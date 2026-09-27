@@ -1021,7 +1021,23 @@ pub struct Host {
     /// wire event per token and handing it to the swarm to throw away. On a workspace nobody is
     /// watching — which is most of them, most of the time — streaming costs one set lookup per
     /// token and nothing else.
-    swarm_watched: std::collections::HashSet<neosh_proto::SessionId>,
+    ///
+    /// *Which* machines, because a machine watching is somebody reading: a turn that ends in front
+    /// of a watcher is not news to anybody, and a set that could only grow said every conversation
+    /// ever opened from anywhere was being read for the rest of the workspace's life.
+    /// Mirrors whose running turn has been drawn here from its start — by its `TurnStarted`, or
+    /// whole out of a history — rather than joined at some token half way through.
+    mirror_whole: std::collections::HashSet<neosh_proto::SessionId>,
+    /// Mirrors whose last turn was drawn whole and live, so the history its end brings is already
+    /// on screen. Spent by that history.
+    mirror_drawn: std::collections::HashSet<neosh_proto::SessionId>,
+    /// The pictures each mirror's transcript names, by the owner's path: the copy here, and the
+    /// ones asked for and not yet arrived. See [`Host::localise_pictures`].
+    mirror_pictures: std::collections::HashMap<neosh_proto::SessionId, MirrorPictures>,
+    swarm_watched: std::collections::HashMap<
+        neosh_proto::SessionId,
+        std::collections::HashSet<neosh_proto::NodeId>,
+    >,
     /// Machines that proved who they are and are not paired with.
     ///
     /// Kept rather than only notified about: pairing is a decision a person makes at their own
@@ -1366,6 +1382,48 @@ enum Said {
     Tool { call: neosh_proto::ToolCall, result: Option<neosh_proto::ToolResult> },
 }
 
+/// What a round has said, as the messages it would have committed: the shape a model driver's
+/// rounds land in, which is the shape [`transcript`] draws a card and its answer from.
+fn said_messages(said: Vec<Said>, at: i64) -> Vec<neosh_proto::Message> {
+    use neosh_proto::{ContentBlock, Message, Role};
+    let mut out: Vec<Message> = Vec::new();
+    let mut blocks: Vec<ContentBlock> = Vec::new();
+    for item in said {
+        match item {
+            Said::Text(text) if text.is_empty() => {}
+            Said::Text(text) => blocks.push(ContentBlock::Text { text }),
+            Said::Tool { call, result } => {
+                blocks.push(ContentBlock::ToolUse {
+                    id: call.id.clone(),
+                    name: call.name,
+                    input: call.input,
+                });
+                if let Some(r) = result {
+                    out.push(Message {
+                        role: Role::Assistant,
+                        content: std::mem::take(&mut blocks),
+                        at: Some(at),
+                    });
+                    out.push(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::ToolResult {
+                            tool_use_id: call.id,
+                            content: r.content,
+                            is_error: r.is_error,
+                            images: r.images,
+                        }],
+                        at: Some(at),
+                    });
+                }
+            }
+        }
+    }
+    if !blocks.is_empty() {
+        out.push(Message { role: Role::Assistant, content: blocks, at: Some(at) });
+    }
+    out
+}
+
 // Deliberately no row index. The working line is *always the last line of the transcript* and
 // everything else inserts above it, which makes "where is it" a question with one answer instead of
 // a number to keep in step with four different append paths. The first version tracked a row and
@@ -1450,6 +1508,87 @@ enum SwarmAsk {
     Relay,
     /// That machine's providers and models, for a mirror's model picker and footer.
     Catalogue,
+    /// A picture a mirror's transcript names. Nobody pressed anything for it, so a refusal is not
+    /// said: the transcript goes on showing the picture's name, which is what it showed before.
+    Picture,
+}
+
+/// A mirror's pictures, as [`Host::mirror_pictures`] keeps them.
+#[derive(Default)]
+struct MirrorPictures {
+    /// The owner's path, and the copy of it on this disk.
+    have: std::collections::HashMap<String, neosh_proto::ImageFile>,
+    /// Asked for and not yet here. Once each: a picture the owner will not send is not asked for
+    /// again on every redraw.
+    asked: std::collections::HashSet<String>,
+}
+
+/// A prompt's pictures, as the files they are.
+fn picture_files(blocks: &[neosh_proto::ContentBlock]) -> Vec<neosh_proto::ImageFile> {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            neosh_proto::ContentBlock::Image { path, media_type } => Some(neosh_proto::ImageFile {
+                path: path.clone(),
+                media_type: media_type.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The most of a frame the pictures on one message may take, as base64 — under the swarm's
+/// eight-megabyte cap with room for the words and the envelope.
+const PICTURE_BUDGET: usize = 6 * 1024 * 1024;
+
+/// Every picture a conversation's messages name, by path.
+fn pictures_in(messages: &[neosh_proto::Message]) -> Vec<String> {
+    use neosh_proto::ContentBlock as B;
+    let mut out = Vec::new();
+    for m in messages {
+        for b in &m.content {
+            match b {
+                B::Image { path, .. } => out.push(path.clone()),
+                B::ToolResult { images, .. } => out.extend(images.iter().map(|i| i.path.clone())),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Point every picture in `messages` that has a copy here at the copy.
+fn repoint_messages(
+    messages: &mut [neosh_proto::Message],
+    have: &std::collections::HashMap<String, neosh_proto::ImageFile>,
+) {
+    use neosh_proto::ContentBlock as B;
+    for m in messages {
+        for b in &mut m.content {
+            match b {
+                B::Image { path, media_type } => {
+                    if let Some(f) = have.get(path.as_str()) {
+                        *path = f.path.clone();
+                        *media_type = f.media_type.clone();
+                    }
+                }
+                B::ToolResult { images, .. } => repoint_files(images, have),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// [`repoint_messages`], for a list of files.
+fn repoint_files(
+    files: &mut [neosh_proto::ImageFile],
+    have: &std::collections::HashMap<String, neosh_proto::ImageFile>,
+) {
+    for f in files {
+        if let Some(local) = have.get(f.path.as_str()) {
+            *f = local.clone();
+        }
+    }
 }
 
 /// A prompt open here that the machines watching its conversation were offered.
@@ -1616,6 +1755,9 @@ impl Host {
             swarm_opening: Default::default(),
             swarm_next_command: 0,
             swarm_watched: Default::default(),
+            mirror_whole: Default::default(),
+            mirror_drawn: Default::default(),
+            mirror_pictures: Default::default(),
             swarm_strangers: Default::default(),
             swarm_allowed: neosh_swarm::Allowed::load(None),
             swarm_events: None,
@@ -3777,6 +3919,7 @@ impl Host {
             self.stream_out(&session, neosh_proto::StreamEvent::Asked {
                 text: prompt.text.clone(),
                 images: prompt.images.len() as u32,
+                pictures: picture_files(&prompt.images),
             });
         }
         let token = CancellationToken::new();
@@ -3993,6 +4136,57 @@ impl Host {
         self.notifier.offer(reason, session, crate::notify::Alert { title, body, level });
     }
 
+    /// Say what another machine's conversations did that nobody saw: a turn that finished while
+    /// nobody was reading it anywhere, and one that stopped to ask something.
+    ///
+    /// The owner raises these on its own screen, which for a machine in a cupboard is nobody's —
+    /// so the person who would have been told, sitting here, was not, and found out by the row
+    /// turning amber whenever they next looked at the panel. Read off the roster, because that is
+    /// the one thing every paired machine hears about every conversation: a turn that ended and is
+    /// `unread` is one nobody was watching, which is exactly the one a notification is for. One
+    /// that is open here is left to the mirror, whose own ending — or relayed question — already
+    /// says it.
+    fn alert_remote_turns(
+        &mut self,
+        node: &neosh_proto::NodeId,
+        before: &[neosh_proto::AgentSummary],
+    ) {
+        use neosh_proto::AgentState as A;
+        let Some(peer) = self.swarm.peer(node) else { return };
+        let machine = peer.display_name();
+        let now: Vec<neosh_proto::AgentSummary> = peer.agents.clone();
+        for a in now {
+            let Some(was) = before.iter().find(|b| b.session == a.session) else { continue };
+            if self.mirror_of(node, &a.session).is_some() {
+                continue;
+            }
+            let turning = |s: A| matches!(s, A::Running | A::Blocked);
+            if turning(was.state) && !turning(a.state) && a.unread {
+                let took = was.turn_started_at.map(|at| now_secs().saturating_sub(at).max(0));
+                let min = self.notifier.config().min_turn.as_secs() as i64;
+                if took.is_some_and(|secs| secs < min) {
+                    continue;
+                }
+                let (reason, level, what) = if a.interrupted {
+                    (crate::notify::AlertReason::Failure, MessageLevel::Warn, "was cut off")
+                } else {
+                    (crate::notify::AlertReason::TurnDone, MessageLevel::Info, "finished")
+                };
+                self.alert(reason, Some(&a.session), level, a.label.clone(), format!(
+                    "{what} on {machine}"
+                ));
+            } else if was.state != A::Blocked && a.state == A::Blocked {
+                self.alert(
+                    crate::notify::AlertReason::Question,
+                    Some(&a.session),
+                    MessageLevel::Warn,
+                    a.label.clone(),
+                    format!("is waiting for you on {machine}"),
+                );
+            }
+        }
+    }
+
     /// A conversation is blocked on you answering something.
     ///
     /// The strongest case there is for a notification: the turn is not merely finished, it is
@@ -4080,6 +4274,11 @@ impl Host {
         // The screen in front of you. The unread mark's rule, and the only one of the three that is
         // about where the person is rather than about the turn.
         if self.can_see(session) {
+            return;
+        }
+        // Or on the one in front of you on another machine, which says so itself: its mirror of
+        // this conversation ends the same turn, through the same path.
+        if self.watched(session) {
             return;
         }
         // `<Esc>` is you ending the turn, so a notification saying it ended is a notification about
@@ -5297,6 +5496,12 @@ impl Host {
                 let _ = self.agent.sessions().remove(&local);
                 self.turns.remove(&local);
                 self.rounds.remove(&local);
+                self.mirror_whole.remove(&local);
+                self.mirror_drawn.remove(&local);
+                // The copies of its pictures were only ever for drawing it here.
+                if self.mirror_pictures.remove(&local).is_some() {
+                    let _ = std::fs::remove_dir_all(self.mirror_picture_dir(&local));
+                }
             }
         }
     }
@@ -5319,6 +5524,156 @@ impl Host {
         }
     }
 
+    /// Where the copies of a mirror's pictures go: its own directory, removed when it is let go.
+    fn mirror_picture_dir(&self, local: &neosh_proto::SessionId) -> std::path::PathBuf {
+        self.image_store().join("remote").join(&local.0)
+    }
+
+    /// Ask the owner for every picture this mirror's transcript names that there is no copy of
+    /// here yet — in its messages, and in what the turn in flight has run.
+    ///
+    /// A path in the owner's transcript is a file on the owner's disk, and drawn here as it stood it
+    /// was the picture's *name*: a screenshot the agent read, or the one somebody pasted over there,
+    /// was on every screen but the one watching.
+    fn localise_pictures(&mut self, local: &neosh_proto::SessionId) {
+        let Some(m) = self.mirror_meta(local) else { return };
+        if !self.swarm.peer(&m.node).is_some_and(|p| p.up() && p.capabilities.live) {
+            return;
+        }
+        let mut named = self
+            .agent
+            .sessions()
+            .get(local)
+            .map(|s| pictures_in(&s.messages))
+            .unwrap_or_default();
+        if let Some(r) = self.rounds.get(local) {
+            for item in &r.said {
+                if let Said::Tool { result: Some(res), .. } = item {
+                    named.extend(res.images.iter().map(|i| i.path.clone()));
+                }
+            }
+        }
+        let pics = self.mirror_pictures.entry(local.clone()).or_default();
+        let mine: std::collections::HashSet<String> =
+            pics.have.values().map(|f| f.path.clone()).collect();
+        let wanted: Vec<String> = named
+            .into_iter()
+            .filter(|p| !mine.contains(p) && !pics.have.contains_key(p))
+            .filter(|p| pics.asked.insert(p.clone()))
+            .collect();
+        for path in wanted {
+            self.command_mirror_as(&m, neosh_proto::AgentCommand::Picture { path }, SwarmAsk::Picture);
+        }
+    }
+
+    /// A picture the owner sent, because this mirror asked for it: kept, and every place the
+    /// transcript names it pointed at the copy.
+    fn took_picture(&mut self, local: &neosh_proto::SessionId, path: String, media_type: String, data: &str) {
+        use base64::Engine as _;
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else { return };
+        let dir = self.mirror_picture_dir(local);
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let ext = media_type.strip_prefix("image/").unwrap_or("png");
+        let file = dir.join(format!("{}.{ext}", uuid::Uuid::new_v4()));
+        if std::fs::write(&file, bytes).is_err() {
+            return;
+        }
+        let copy = neosh_proto::ImageFile { path: file.to_string_lossy().into_owned(), media_type };
+        let pics = self.mirror_pictures.entry(local.clone()).or_default();
+        pics.asked.remove(&path);
+        pics.have.insert(path, copy);
+        let have = pics.have.clone();
+        if let Some(s) = self.agent.sessions().get_mut(local) {
+            repoint_messages(&mut s.messages, &have);
+        }
+        if let Some(r) = self.rounds.get_mut(local) {
+            for item in &mut r.said {
+                if let Said::Tool { result: Some(res), .. } = item {
+                    repoint_files(&mut res.images, &have);
+                }
+            }
+        }
+        // Drawn again, where you are: a picture is rows, and the rows it takes are only known once
+        // it is here.
+        self.each_view_showing(local, |me| me.resync_transcript());
+    }
+
+    /// Ask again for every conversation of `node`'s that is open here.
+    fn resubscribe_mirrors(&mut self, node: &neosh_proto::NodeId) {
+        let Some(h) = self.swarm_node.clone() else { return };
+        let remotes: Vec<neosh_proto::SessionId> = self
+            .agent
+            .sessions()
+            .iter()
+            .filter_map(|s| s.mirror.as_ref().filter(|m| &m.node == node).map(|m| m.session.clone()))
+            .collect();
+        for session in remotes {
+            h.send(neosh_swarm::SwarmRequest::Subscribe { node: node.clone(), session });
+        }
+    }
+
+    /// Stop drawing every turn of `node`'s that is running here, without ending it: nothing is
+    /// known about how it ended, and the history that arrives on the next subscribe is the whole
+    /// truth about it — including, when it is still going, the part of it drawn so far.
+    fn drop_mirror_turns(&mut self, node: &neosh_proto::NodeId) {
+        let running: Vec<neosh_proto::SessionId> = self
+            .agent
+            .sessions()
+            .iter()
+            .filter(|s| s.mirror.as_ref().is_some_and(|m| &m.node == node))
+            .map(|s| s.id.clone())
+            .filter(|id| self.turns.contains_key(id))
+            .collect();
+        for local in running {
+            self.each_view_showing(&local, |me| {
+                me.close_answer();
+                me.end_working();
+                me.vm().streaming = None;
+            });
+            self.turns.remove(&local);
+            self.rounds.remove(&local);
+            self.mirror_whole.remove(&local);
+            if let Some(s) = self.agent.sessions().get_mut(&local) {
+                s.active_turn = None;
+                s.turn_started_at = None;
+            }
+            self.each_view_showing(&local, |me| me.refresh_composer());
+        }
+    }
+
+    /// The turn running in `session`, as far as this machine has drawn it — what a machine that
+    /// opens the conversation now is owed besides its messages. See [`neosh_proto::LiveTurn`].
+    fn live_turn(&self, session: &neosh_proto::SessionId) -> Option<neosh_proto::LiveTurn> {
+        if !self.turns.contains_key(session) {
+            return None;
+        }
+        let (turn, started_at) = {
+            let store = self.agent.sessions();
+            let s = store.get(session)?;
+            let turn = s.active_turn.clone()?;
+            (turn.0, s.turn_started_at.or(s.running_since).unwrap_or_else(now_secs))
+        };
+        let round = self.rounds.get(session);
+        let said = round
+            .map(|r| {
+                r.said
+                    .iter()
+                    .map(|item| match item {
+                        Said::Text(text) => neosh_proto::LiveSaid::Text { text: text.clone() },
+                        Said::Tool { call, result } => neosh_proto::LiveSaid::Tool {
+                            call: call.clone(),
+                            result: result.clone(),
+                        },
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let plan = round.map(|r| r.plan.clone()).unwrap_or_default();
+        Some(neosh_proto::LiveTurn { turn, started_at, said, plan })
+    }
+
     /// Send a command to the machine a mirror belongs to, and say so if it refuses.
     fn command_mirror(&mut self, m: &neosh_proto::MirrorOf, command: neosh_proto::AgentCommand) {
         self.command_mirror_as(m, command, SwarmAsk::Mirror);
@@ -5337,6 +5692,13 @@ impl Host {
             command,
             neosh_proto::AgentCommand::Answer { .. } | neosh_proto::AgentCommand::SetMode { .. }
         );
+        // Newer still, and asked for by nobody in particular: a node that cannot read the tag is
+        // simply not asked, and the transcript goes on showing the picture's name.
+        if matches!(command, neosh_proto::AgentCommand::Picture { .. })
+            && !self.swarm.peer(&m.node).is_some_and(|p| p.capabilities.live)
+        {
+            return;
+        }
         if newer && !self.swarm.peer(&m.node).is_some_and(|p| p.capabilities.rich_stream) {
             self.editor_message(
                 MessageLevel::Warn,
@@ -5380,19 +5742,47 @@ impl Host {
         m: &neosh_proto::MirrorOf,
         prompt: Prompt,
     ) {
-        if !prompt.images.is_empty() {
+        // The pictures go as bytes, to a machine that reads them — the owner keeps them the way it
+        // keeps one pasted there, and says where in the `Asked` that draws the question here. As
+        // many as one frame carries; the rest, and all of them for an older machine, are said.
+        let takes = self.swarm.peer(&m.node).is_some_and(|p| p.capabilities.live);
+        let mut images: Vec<neosh_proto::ImageData> = Vec::new();
+        let mut left = 0usize;
+        let mut room = PICTURE_BUDGET;
+        for f in picture_files(&prompt.images) {
+            use base64::Engine as _;
+            let data = match std::fs::read(&f.path) {
+                Ok(bytes) if takes => base64::engine::general_purpose::STANDARD.encode(bytes),
+                _ => {
+                    left += 1;
+                    continue;
+                }
+            };
+            if data.len() > room {
+                left += 1;
+                continue;
+            }
+            room -= data.len();
+            images.push(neosh_proto::ImageData { media_type: f.media_type, data });
+        }
+        if left > 0 {
+            let what = if left == 1 { "a picture".to_string() } else { format!("{left} pictures") };
+            let why = if takes { "too big to send" } else { "runs an older neosh" };
             self.editor_message(
                 MessageLevel::Warn,
-                format!("pictures stay on this computer — sent {} the words only", m.machine),
+                format!("{what} stayed on this computer — {} {why}", m.machine),
             );
         }
-        if prompt.text.trim().is_empty() {
+        if prompt.text.trim().is_empty() && images.is_empty() {
             return;
         }
         // Nothing drawn for a message that is not going anywhere; `command_mirror` says why, and
         // what you wrote goes back in the field rather than into the void.
         if !self.swarm.peer(&m.node).is_some_and(|p| p.up()) {
-            self.command_mirror(m, neosh_proto::AgentCommand::Send { text: prompt.text.clone() });
+            self.command_mirror(m, neosh_proto::AgentCommand::Send {
+                text: prompt.text.clone(),
+                images: Vec::new(),
+            });
             if *local == self.active_session() {
                 self.set_composer(&prompt.text);
                 self.refresh_composer();
@@ -5412,7 +5802,7 @@ impl Host {
             });
         }
         self.each_view_showing(local, |me| me.refresh_composer());
-        self.command_mirror(m, neosh_proto::AgentCommand::Send { text: prompt.text });
+        self.command_mirror(m, neosh_proto::AgentCommand::Send { text: prompt.text, images });
     }
 
     /// A turn over there, begun here: the round the working line and the cards are drawn from.
@@ -5420,6 +5810,17 @@ impl Host {
     /// Called by the first event of a turn rather than only by `TurnStarted`, because a
     /// conversation opened mid-turn joins it at a token.
     fn mirror_turn(&mut self, local: &neosh_proto::SessionId, turn: neosh_proto::TurnId) {
+        self.mirror_turn_drawn(local, turn, true);
+    }
+
+    /// [`Self::mirror_turn`], leaving the drawing to the caller when `draw` is off — a turn taken
+    /// whole from a history is drawn by the rebuild that follows, working line and all.
+    fn mirror_turn_drawn(
+        &mut self,
+        local: &neosh_proto::SessionId,
+        turn: neosh_proto::TurnId,
+        draw: bool,
+    ) {
         if self.turns.contains_key(local) {
             return;
         }
@@ -5439,12 +5840,144 @@ impl Host {
             s.active_turn = Some(turn.clone());
             s.turn_started_at = Some(now_secs());
         }
-        self.each_view_showing(local, |me| {
-            me.scroll_chat(0);
-            me.begin_working();
-            me.refresh_composer();
-        });
+        if draw {
+            self.each_view_showing(local, |me| {
+                me.scroll_chat(0);
+                me.begin_working();
+                me.refresh_composer();
+            });
+        }
         self.on_agent_event(AgentEvent::TurnStarted { session: local.clone(), turn });
+    }
+
+    /// A conversation's history arriving from the machine it belongs to — when it opens, when a
+    /// turn there ends, and whenever anybody else starts watching it.
+    ///
+    /// Taken as the truth about the conversation, and drawn only when it says something this
+    /// screen does not already show. A turn watched here from its first event was drawn by the
+    /// same code that drew it over there, closing rows and all — its plan, what it changed, what it
+    /// left running — and rebuilding from the messages at its end is what took every one of those
+    /// back off the screen, which is exactly the difference between the two machines a person
+    /// sitting at both could see.
+    fn mirror_history(
+        &mut self,
+        node: &neosh_proto::NodeId,
+        local: &neosh_proto::SessionId,
+        messages: Vec<neosh_proto::Message>,
+        live: Option<neosh_proto::LiveTurn>,
+        interrupted: bool,
+    ) {
+        // Whether "nothing running" is something the owner said, or only something it left out.
+        let says_live = self.swarm.peer(node).is_some_and(|p| p.capabilities.live);
+        let drawn = self.mirror_drawn.remove(local);
+        // The pictures already here, pointed at before anything compares: the copy here names the
+        // copies, and the owner's names its own files.
+        let mut messages = messages;
+        let mut live = live;
+        if let Some(pics) = self.mirror_pictures.get(local) {
+            repoint_messages(&mut messages, &pics.have);
+            if let Some(l) = live.as_mut() {
+                for item in &mut l.said {
+                    if let neosh_proto::LiveSaid::Tool { result: Some(r), .. } = item {
+                        repoint_files(&mut r.images, &pics.have);
+                    }
+                }
+            }
+        }
+        let changed = {
+            let mut store = self.agent.sessions();
+            let Some(s) = store.get_mut(local) else { return };
+            let changed = s.messages != messages || s.interrupted != interrupted;
+            s.messages = messages;
+            s.interrupted = interrupted;
+            changed
+        };
+        match live {
+            Some(l) => {
+                // The turn over there as far as it has got, which replaces whatever this screen
+                // drew of it: that may have started half way through, and this did not.
+                let turn = neosh_proto::TurnId(l.turn.clone());
+                self.mirror_turn_drawn(local, turn.clone(), false);
+                let said: Vec<Said> = l
+                    .said
+                    .into_iter()
+                    .map(|item| match item {
+                        neosh_proto::LiveSaid::Text { text } => Said::Text(text),
+                        neosh_proto::LiveSaid::Tool { call, result } => Said::Tool { call, result },
+                    })
+                    .collect();
+                let mut changes: Vec<cards::FileStat> = Vec::new();
+                for item in &said {
+                    if let Said::Tool { call, result: Some(r) } = item
+                        && !r.is_error
+                    {
+                        cards::tally(&mut changes, &cards::edits_of(&call.input));
+                    }
+                }
+                let ago = u64::try_from(now_secs().saturating_sub(l.started_at)).unwrap_or(0);
+                if let Some(r) = self.rounds.get_mut(local) {
+                    r.said = said;
+                    r.plan = l.plan;
+                    r.changes = changes;
+                    r.started = std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_secs(ago))
+                        .unwrap_or_else(std::time::Instant::now);
+                }
+                if let Some(s) = self.agent.sessions().get_mut(local) {
+                    s.active_turn = Some(turn);
+                    s.turn_started_at = Some(l.started_at);
+                }
+                self.mirror_whole.insert(local.clone());
+                self.each_view_showing(local, |me| me.resync_transcript());
+            }
+            None if self.turns.contains_key(local) => {
+                // An owner too old to say what is running, mid-turn: the turn is being drawn live,
+                // and the re-sync at its end puts the rest right.
+                if !says_live {
+                    return;
+                }
+                // Nothing is running over there, so its ending never reached this machine — a
+                // link that dropped between the two. Put down without drawing an ending nobody
+                // here saw, and drawn from what was recorded.
+                self.turns.remove(local);
+                self.rounds.remove(local);
+                self.mirror_whole.remove(local);
+                if let Some(s) = self.agent.sessions().get_mut(local) {
+                    s.active_turn = None;
+                    s.turn_started_at = None;
+                }
+                self.each_view_showing(local, |me| {
+                    me.resync_transcript();
+                    me.refresh_composer();
+                });
+                self.refresh_status();
+            }
+            None => {
+                if changed && !drawn {
+                    self.each_view_showing(local, |me| me.resync_transcript());
+                }
+            }
+        }
+    }
+
+    /// Rebuild the transcript on screen from the conversation's messages and the turn in flight,
+    /// leaving where you are alone — the scroll, the cursor, the draft. [`Self::enter_session`]
+    /// without the arriving.
+    fn resync_transcript(&mut self) {
+        if self.v().term {
+            return;
+        }
+        self.vm().answer = None;
+        self.vm().streaming = None;
+        self.vm().unanswered = None;
+        self.vm().working = false;
+        self.vm().plan_rows = 0;
+        self.redraw_transcript();
+        // The buffer was replaced whole, so neither the welcome nor anything else it drew is
+        // still where it was.
+        self.vm().welcome_rows = 0;
+        self.draw_welcome();
+        self.replay_round();
     }
 
     /// One event of another machine's conversation, drawn in the one here that mirrors it.
@@ -5463,17 +5996,18 @@ impl Host {
         let Some(local) = self.mirror_of(node, remote) else { return };
         let turn = |t: &str| neosh_proto::TurnId(t.to_string());
         match event.clone() {
-            S::History { messages } => {
-                if let Some(s) = self.agent.sessions().get_mut(&local) {
-                    s.messages = messages;
-                }
-                // Not over a turn in flight: that is being drawn live, and rebuilding under it
-                // would draw its answer twice. The re-sync at its end puts the rest right.
+            S::History { messages, live, interrupted } => {
+                self.mirror_history(node, &local, messages, live, interrupted);
+                self.localise_pictures(&local);
+            }
+            S::TurnStarted { turn: t } => {
+                // From its first event, so everything it draws here is drawn by the path that drew
+                // it over there — which is what lets its end leave the screen alone.
                 if !self.turns.contains_key(&local) {
-                    self.each_view_showing(&local, |me| me.redraw_transcript());
+                    self.mirror_turn(&local, turn(&t));
+                    self.mirror_whole.insert(local);
                 }
             }
-            S::TurnStarted { turn: t } => self.mirror_turn(&local, turn(&t)),
             S::Token { turn: t, text } => {
                 self.mirror_turn(&local, turn(&t));
                 self.on_agent_event(AgentEvent::Token { session: local, turn: turn(&t), text });
@@ -5494,26 +6028,56 @@ impl Host {
                 self.mirror_turn(&local, turn(&t));
                 self.on_agent_event(AgentEvent::ToolStarted { session: local, turn: turn(&t), call });
             }
-            S::ToolFinished { turn: t, call, result } => {
+            S::ToolFinished { turn: t, call, mut result } => {
                 self.mirror_turn(&local, turn(&t));
+                if let Some(pics) = self.mirror_pictures.get(&local) {
+                    repoint_files(&mut result.images, &pics.have);
+                }
+                let pictures = !result.images.is_empty();
                 self.on_agent_event(AgentEvent::ToolFinished {
-                    session: local,
+                    session: local.clone(),
                     turn: turn(&t),
                     call,
                     result,
                 });
-            }
-            S::Asked { text, images } => {
-                let shown = match images {
-                    0 => text.clone(),
-                    1 => format!("{text}\n[a picture, on the other computer]"),
-                    n => format!("{text}\n[{n} pictures, on the other computer]"),
-                };
-                if let Some(s) = self.agent.sessions().get_mut(&local) {
-                    s.push_user(&Prompt::text(shown.clone()), Some(now_secs()));
+                if pictures {
+                    self.localise_pictures(&local);
                 }
-                let prompt = Prompt::text(shown);
+            }
+            S::Asked { text, images, pictures } => {
+                // The pictures themselves when the owner said where they are — asked for below and
+                // drawn when they land — and a sentence standing in for them when it did not.
+                let shown = match (images, pictures.is_empty()) {
+                    (_, false) | (0, _) => text.clone(),
+                    (1, _) => format!("{text}\n[a picture, on the other computer]"),
+                    (n, _) => format!("{text}\n[{n} pictures, on the other computer]"),
+                };
+                let mut pictures = pictures;
+                if let Some(pics) = self.mirror_pictures.get(&local) {
+                    repoint_files(&mut pictures, &pics.have);
+                }
+                let blocks: Vec<neosh_proto::ContentBlock> = pictures
+                    .into_iter()
+                    .map(|f| neosh_proto::ContentBlock::Image { path: f.path, media_type: f.media_type })
+                    .collect();
+                let asked_pictures = !blocks.is_empty();
                 let running = self.turns.contains_key(&local);
+                // Steered in mid-turn: over there, what the turn had said so far was committed
+                // before the question was taken in, and a rebuild here — a switch away and back —
+                // has to find it above the question rather than replayed under it.
+                let before = if running {
+                    self.rounds
+                        .get_mut(&local)
+                        .map(|r| said_messages(std::mem::take(&mut r.said), now_secs()))
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let prompt = Prompt { text: shown, images: blocks };
+                if let Some(s) = self.agent.sessions().get_mut(&local) {
+                    s.messages.extend(before);
+                    s.push_user(&prompt, Some(now_secs()));
+                }
                 self.each_view_showing(&local, |me| {
                     me.scroll_chat(0);
                     me.chat_question(&prompt);
@@ -5522,9 +6086,19 @@ impl Host {
                     }
                     me.refresh_composer();
                 });
+                if asked_pictures {
+                    self.localise_pictures(&local);
+                }
             }
             S::TurnEnded { turn: t, stop_reason, usage } => {
                 if self.turns.contains_key(&local) {
+                    // Drawn whole and live, so the screen already says what the owner's does and
+                    // the history this ending brings needs no rebuild. A turn joined half way
+                    // through, or streamed by a machine that sends no tool events, does.
+                    let rich = self.swarm.peer(node).is_some_and(|p| p.capabilities.rich_stream);
+                    if self.mirror_whole.remove(&local) && rich {
+                        self.mirror_drawn.insert(local.clone());
+                    }
                     if let Some(s) = self.agent.sessions().get_mut(&local) {
                         s.active_turn = None;
                         s.turn_started_at = None;
@@ -5555,6 +6129,18 @@ impl Host {
                 self.relay_here(&local, node, id, offer);
             }
             S::Settled { id } => self.unrelay(&id),
+            S::Image { path, media_type, data } => {
+                self.took_picture(&local, path, media_type, &data);
+            }
+            S::Notice { level, text } => {
+                let machine = self
+                    .agent
+                    .sessions()
+                    .get(&local)
+                    .and_then(|s| s.mirror.as_ref().map(|m| m.machine.clone()))
+                    .unwrap_or_default();
+                self.editor_message(level, format!("{machine}: {text}"));
+            }
             S::Blocked { prompt, .. } => {
                 let machine = self
                     .agent
@@ -5901,6 +6487,7 @@ impl Host {
             shells: false,
             rich_stream: false,
             catalogue: false,
+            live: false,
             projects: Vec::new(),
         };
         let bridge = self.bridge.clone();
@@ -5951,7 +6538,7 @@ impl Host {
 
     /// Whether anything would come of streaming this conversation.
     fn watched(&self, session: &neosh_proto::SessionId) -> bool {
-        self.swarm_node.is_some() && self.swarm_watched.contains(session)
+        self.swarm_node.is_some() && self.swarm_watched.get(session).is_some_and(|w| !w.is_empty())
     }
 
     /// Everything this machine is running, as the wire describes it.
@@ -5961,6 +6548,7 @@ impl Host {
     /// wrong on the machine you are not sitting at — which is the one case you cannot check.
     fn local_inventory(&mut self) -> Vec<neosh_proto::AgentSummary> {
         let sessions = self.agent.sessions().list_with(false);
+        let mut marks = self.row_decorations();
         sessions
             .into_iter()
             .map(|s| {
@@ -5975,9 +6563,42 @@ impl Host {
                     .and_then(|s| s.selection.clone())
                     .or_else(|| self.agent.selection());
                 let mode = self.agent.permission_mode(&info.id);
-                crate::swarm::summarise(&info, key, selection.as_ref(), Some(mode))
+                let mut summary = crate::swarm::summarise(&info, key, selection.as_ref(), Some(mode));
+                // Waiting on a person, which the store cannot know and a panel must: a row that
+                // says *working* over a question is the one row in the list that most needs
+                // finding, drawn as the nineteen that do not.
+                if self.asking.contains(&info.id) || self.permitting.contains(&info.id) {
+                    summary.state = neosh_proto::AgentState::Blocked;
+                }
+                summary.decorations = marks.remove(&format!("session:{}", info.id.0)).unwrap_or_default();
+                summary
             })
             .collect()
+    }
+
+    /// Every `sidebar.decoration` contribution, by the row it is about — `project:<cwd>`,
+    /// `session:<id>` — in the registry's order, which is the order a panel merges them in.
+    ///
+    /// What this machine's panel wears on each row, as data another machine's panel can wear too.
+    /// The key is read the way `decorationKey` in `@neosh/api/ui` reads it: the target's first
+    /// string field by name.
+    fn row_decorations(&mut self) -> std::collections::HashMap<String, Vec<serde_json::Value>> {
+        let plugin = PluginId::from(BUILTIN);
+        let contributions =
+            match self.editor.apply(&plugin, ApiCall::ExtList { point: "sidebar.decoration".into() }) {
+                Ok(ApiOk::Contributions { contributions }) => contributions,
+                _ => Vec::new(),
+            };
+        let mut out: std::collections::HashMap<String, Vec<serde_json::Value>> = Default::default();
+        for c in contributions {
+            let Some(target) = c.item.get("target").and_then(|t| t.as_object()) else { continue };
+            let mut fields: Vec<(&String, &str)> =
+                target.iter().filter_map(|(k, v)| v.as_str().map(|v| (k, v))).collect();
+            fields.sort_by(|a, b| a.0.cmp(b.0));
+            let Some((k, v)) = fields.first() else { continue };
+            out.entry(format!("{k}:{v}")).or_default().push(c.item.clone());
+        }
+        out
     }
 
     /// What a directory is called across machines. See [`neosh_proto::ProjectKey`].
@@ -6020,12 +6641,28 @@ impl Host {
         &mut self,
         agents: &[neosh_proto::AgentSummary],
     ) -> Vec<neosh_proto::RemoteProject> {
+        let mut out = self.local_project_list(agents);
+        let mut marks = self.row_decorations();
+        for p in &mut out {
+            p.decorations = marks.remove(&format!("project:{}", p.cwd)).unwrap_or_default();
+        }
+        out
+    }
+
+    /// [`Self::local_projects`], undecorated.
+    fn local_project_list(
+        &mut self,
+        agents: &[neosh_proto::AgentSummary],
+    ) -> Vec<neosh_proto::RemoteProject> {
         let mut out: Vec<neosh_proto::RemoteProject> = Vec::new();
         for a in agents {
             match out.iter_mut().find(|p| p.cwd == a.cwd) {
                 Some(p) => {
                     p.sessions += 1;
-                    p.running += u32::from(a.state == neosh_proto::AgentState::Running);
+                    p.running += u32::from(matches!(
+                        a.state,
+                        neosh_proto::AgentState::Running | neosh_proto::AgentState::Blocked
+                    ));
                 }
                 None => out.push(neosh_proto::RemoteProject {
                     key: a.project.clone(),
@@ -6040,7 +6677,11 @@ impl Host {
                         .and_then(|h| h.commit),
                     active: true,
                     sessions: 1,
-                    running: u32::from(a.state == neosh_proto::AgentState::Running),
+                    running: u32::from(matches!(
+                        a.state,
+                        neosh_proto::AgentState::Running | neosh_proto::AgentState::Blocked
+                    )),
+                    decorations: Vec::new(),
                 }),
             }
         }
@@ -6092,6 +6733,7 @@ impl Host {
                 active: false,
                 sessions: 0,
                 running: 0,
+                decorations: Vec::new(),
             });
         }
 
@@ -6172,6 +6814,10 @@ impl Host {
                     );
                     // It has just connected and knows nothing about us until we say so.
                     self.publish_inventory();
+                    // Nor about what we were watching: a connection starts with no subscriptions,
+                    // so every conversation of theirs open here would otherwise go on showing the
+                    // moment the link dropped, and never move again.
+                    self.resubscribe_mirrors(&node.id);
                 }
                 self.broadcast(PluginEvent::SwarmChanged);
             }
@@ -6188,6 +6834,17 @@ impl Host {
                 if was_up {
                     self.editor_message(MessageLevel::Warn, format!("lost {name}"));
                 }
+                // Nobody over there is reading anything of ours now. A new connection starts with
+                // no subscriptions, so this is also what stops a conversation it had open counting
+                // as read for the rest of the workspace's life.
+                self.swarm_watched.retain(|_, w| {
+                    w.remove(&node);
+                    !w.is_empty()
+                });
+                // And a turn of theirs we were drawing will send no ending: the working line
+                // would spin for ever over a transcript that stopped. Put down here and picked up
+                // again, as it stands, when the link comes back and the mirror resubscribes.
+                self.drop_mirror_turns(&node);
                 // Every shell that machine opened here. `Serving`'s `Drop` kills the child, so
                 // this is the whole of it — and it is the one cleanup nothing else would do.
                 self.close_shells_for(&node);
@@ -6255,8 +6912,11 @@ impl Host {
                 self.bridge.broadcast(PluginEvent::SwarmChanged);
             }
             E::Inventory { node, full, agents, gone } => {
+                let before: Vec<neosh_proto::AgentSummary> =
+                    self.swarm.peer(&node).map(|p| p.agents.clone()).unwrap_or_default();
                 self.swarm.inventory(&node, full, agents, gone);
                 self.follow_mirrors(&node);
+                self.alert_remote_turns(&node, &before);
                 self.broadcast(PluginEvent::SwarmChanged);
             }
             E::Stream { node, session, event } => {
@@ -6293,6 +6953,10 @@ impl Host {
                     self.swarm_asking.remove(&id);
                     let _ = result;
                     self.took_catalogue(node, None);
+                    return;
+                }
+                if self.swarm_asking.get(&id) == Some(&SwarmAsk::Picture) {
+                    self.swarm_asking.remove(&id);
                     return;
                 }
                 if self.swarm_asking.get(&id) == Some(&SwarmAsk::Relay) {
@@ -6396,21 +7060,41 @@ impl Host {
             E::Browsed { id, result, .. } => {
                 self.on_swarm_browsed(&id, result.map_err(|r| refusal_text(&r)));
             }
-            E::Subscribed { session, .. } => {
-                self.swarm_watched.insert(session.clone());
+            E::Subscribed { node, session } => {
+                self.swarm_watched.entry(session.clone()).or_default().insert(node);
+                // Opening a conversation from another machine is arriving in it: the answer that
+                // made the row amber is on that screen now, and a mark that only a keyboard *here*
+                // could clear would sit on every machine's panel until somebody walked over to this
+                // one. Said at once rather than on the roster clock, because the row is what
+                // somebody just pressed `↵` on.
+                if self.agent.sessions().mark_read(&session) {
+                    self.persist_session(&session);
+                    self.publish_inventory();
+                }
                 // Everything said so far — on **every** subscribe, not only the first. A watcher
                 // that only received deltas would show an empty conversation until the next token,
                 // which for an idle agent is never; and "only the first" meant the second machine
                 // to open a conversation, and every re-sync after a turn, got nothing at all. It
                 // goes to everybody watching, who each take it as the truth about the whole
                 // conversation, which it is.
-                let messages = self
+                //
+                // With the turn in flight, as far as it has got: the messages hold nothing of it
+                // until it commits, which for an agent driver is when its whole loop is over — so a
+                // machine opening a conversation mid-turn saw the question, no working line, and
+                // nothing under it for as long as the turn ran.
+                let (messages, interrupted) = self
                     .agent
                     .sessions()
                     .get(&session)
-                    .map(|s| s.messages.clone())
+                    .map(|s| (s.messages.clone(), s.interrupted))
                     .unwrap_or_default();
-                self.stream_out(&session, neosh_proto::StreamEvent::History { messages });
+                let live = self.live_turn(&session);
+                let (messages, live) = crate::swarm::fit_history(messages, live);
+                self.stream_out(&session, neosh_proto::StreamEvent::History {
+                    messages,
+                    live,
+                    interrupted,
+                });
                 // And anything it is waiting on. A machine that opens a conversation mid-question
                 // is very often opening it *because* of the question.
                 let waiting: Vec<neosh_proto::StreamEvent> = self
@@ -6423,12 +7107,15 @@ impl Host {
                     self.stream_out(&session, event);
                 }
             }
-            E::Unsubscribed { session, .. } => {
-                // Not removed from the set: another peer may still be watching, and the node knows
-                // who wants what. Cleared when nobody does, which the node cannot tell us without a
-                // count — so this errs towards sending events nobody reads rather than towards a
-                // conversation that silently stops streaming.
-                let _ = session;
+            E::Unsubscribed { node, session } => {
+                // Only that machine's interest: another may still be watching, and the node is
+                // what decides who each event goes to anyway.
+                if let Some(w) = self.swarm_watched.get_mut(&session) {
+                    w.remove(&node);
+                    if w.is_empty() {
+                        self.swarm_watched.remove(&session);
+                    }
+                }
             }
             E::Command { node, id, session, command } => {
                 self.run_swarm_command(node, id, session, command);
@@ -6487,10 +7174,67 @@ impl Host {
                 }
             }
             _ if !known => Err(neosh_proto::Refusal::NoSuchAgent),
-            // Words only. A peer on another machine naming a path would be naming a file on
-            // *its* disk, and this side would read whatever happened to be at that path here.
-            C::Send { text } => {
-                self.start_turn_in(session.clone(), Prompt::text(text));
+            // Words, and pictures as bytes. A peer on another machine naming a path would be naming
+            // a file on *its* disk, and this side would read whatever happened to be at that path
+            // here — so what arrives is kept the way a picture pasted here is, and the prompt names
+            // the copy.
+            C::Send { text, images } => {
+                let store = self.image_store();
+                let mut blocks = Vec::new();
+                for image in images {
+                    use base64::Engine as _;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(image.data.as_bytes())
+                        .map_err(|_| neosh_proto::Refusal::Failed {
+                            message: "a picture that is not base64".into(),
+                        })?;
+                    let kept = crate::images::from_bytes(&store, bytes)
+                        .map_err(|message| neosh_proto::Refusal::Failed { message })?;
+                    blocks.push(kept.block());
+                }
+                self.start_turn_in(session.clone(), Prompt { text, images: blocks });
+                Ok(None)
+            }
+            // A picture this conversation's transcript names, and only one: the path is a file on
+            // this disk, and a watcher that could name any other would be reading this machine
+            // through a conversation.
+            C::Picture { path } => {
+                let named = {
+                    let store = self.agent.sessions();
+                    let mut named = store
+                        .get(&session)
+                        .map(|s| pictures_in(&s.messages))
+                        .unwrap_or_default();
+                    if let Some(r) = self.rounds.get(&session) {
+                        for item in &r.said {
+                            if let Said::Tool { result: Some(res), .. } = item {
+                                named.extend(res.images.iter().map(|i| i.path.clone()));
+                            }
+                        }
+                    }
+                    named.contains(&path)
+                };
+                if !named {
+                    return Err(neosh_proto::Refusal::NotPermitted {
+                        what: "a picture this conversation does not show".into(),
+                    });
+                }
+                let bytes = std::fs::read(&path).map_err(|e| neosh_proto::Refusal::Failed {
+                    message: format!("could not read the picture: {e}"),
+                })?;
+                use base64::Engine as _;
+                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                if data.len() > PICTURE_BUDGET {
+                    return Err(neosh_proto::Refusal::Failed {
+                        message: "the picture is too big to send".into(),
+                    });
+                }
+                let media_type = crate::images::media_type_of(&bytes).unwrap_or("image/png");
+                self.stream_out(&session, neosh_proto::StreamEvent::Image {
+                    path,
+                    media_type: media_type.to_string(),
+                    data,
+                });
                 Ok(None)
             }
             C::Interrupt => {
@@ -9695,12 +10439,12 @@ impl Host {
         let here = self.active_session();
         let running = self.turns.contains_key(&here);
         let offset = self.chat_clock().map(|(offset, _)| offset);
-        let (lines, marks, times) = {
+        let (lines, marks, cards, times) = {
             let store = self.agent.sessions();
             let Some(s) = store.get(&here) else { return };
-            let (lines, marks, _, times) =
+            let (lines, marks, cards, times) =
                 transcript(s, ascii, limits, width, show_tools, running, offset);
-            (lines, marks, times)
+            (lines, marks, cards, times)
         };
         let plugin = PluginId::from(BUILTIN);
         // Marks first, and all of them: a mark clamps rather than dies when the line under it is
@@ -9720,6 +10464,9 @@ impl Host {
         });
         self.draw_marks(&marks, 0);
         self.draw_turn_times(&times);
+        // The rows the cards are on now. The ones recorded before addressed a buffer that has just
+        // been replaced, and `⇥` or the next call joining a run would find a card by them.
+        self.vm().cards = cards;
     }
 
     fn enter_session(&mut self) {
@@ -11373,7 +12120,10 @@ impl Host {
         // Whether *anybody* is looking. It used to be "is this the conversation on screen", which
         // had one answer because there was one screen; now it is a question about every terminal,
         // and the drawing that follows is done once in each of the ones that says yes.
-        let seen = !self.views_showing(ev.session()).is_empty();
+        //
+        // Including from another machine: a watcher is somebody reading this conversation, and a
+        // turn that ends in front of them is not news to be kept for whoever next looks here.
+        let seen = !self.views_showing(ev.session()).is_empty() || self.watched(ev.session());
         match ev {
             AgentEvent::TurnStarted { session, turn } => {
                 // Write down that a turn is in flight, and clear whatever the last one left. This
@@ -11647,6 +12397,7 @@ impl Host {
                     self.stream_out(&session, neosh_proto::StreamEvent::Asked {
                         text: prompt.text.clone(),
                         images: prompt.images.len() as u32,
+                        pictures: picture_files(&prompt.images),
                     });
                 }
                 // A turn opened to hear the agent out has just been handed a question, so it is not
@@ -11680,7 +12431,18 @@ impl Host {
                 }
                 self.handle_activity(session, turn, activity);
             }
-            AgentEvent::Notice { level, text, .. } => self.editor_message(level, text),
+            AgentEvent::Notice { session, level, text } => {
+                // A provider failing mid-stream is said here and nowhere else, so somebody reading
+                // this conversation from another machine is told too — or the turn there simply
+                // stops, with the reason in a corner of a screen nobody is looking at.
+                if self.watched(&session) {
+                    self.stream_out(&session, neosh_proto::StreamEvent::Notice {
+                        level,
+                        text: text.clone(),
+                    });
+                }
+                self.editor_message(level, text);
+            }
         }
     }
 
@@ -11894,6 +12656,12 @@ impl Host {
             // provider, so reading the active selection here would file `codex`'s weekly figure
             // under the account you happen to have open.
             Activity::Quota { plan, windows, credits } => {
+                // Another machine's plan, reported by its own login: filed here it would land on
+                // whichever of this machine's instances shares the id, and the strip would say
+                // your allowance moved when somebody else's did.
+                if self.mirror_meta(&session).is_some() {
+                    return;
+                }
                 let Some(instance) = self.instance_of(&session) else { return };
                 self.take_quota(
                     instance,
