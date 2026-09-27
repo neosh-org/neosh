@@ -1,6 +1,6 @@
 {
   "name": "@neosh/api",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "The neosh plugin API. Types are generated from the Rust side and drift-checked in CI.",
   "license": "MIT",
   "type": "module",

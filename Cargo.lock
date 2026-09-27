@@ -2388,7 +2388,7 @@ dependencies = [
 
 [[package]]
 name = "neosh"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2434,7 +2434,7 @@ dependencies = [
 
 [[package]]
 name = "neosh-agent"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -2453,7 +2453,7 @@ dependencies = [
 
 [[package]]
 name = "neosh-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "insta",
  "neosh-proto",
@@ -2468,14 +2468,14 @@ dependencies = [
 
 [[package]]
 name = "neosh-plugins"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "include_dir",
 ]
 
 [[package]]
 name = "neosh-proto"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2485,7 +2485,7 @@ dependencies = [
 
 [[package]]
 name = "neosh-provider"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -2508,7 +2508,7 @@ dependencies = [
 
 [[package]]
 name = "neosh-script"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "deno_ast",
@@ -2531,7 +2531,7 @@ dependencies = [
 
 [[package]]
 name = "neosh-swarm"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -2547,7 +2547,7 @@ dependencies = [
 
 [[package]]
 name = "neosh-syntax"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "syntect",
  "two-face",
@@ -2555,7 +2555,7 @@ dependencies = [
 
 [[package]]
 name = "neosh-tui"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "base64",
  "crossterm",
@@ -2578,7 +2578,7 @@ dependencies = [
 
 [[package]]
 name = "neosh-vcs"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "neosh-proto",
  "serde",
