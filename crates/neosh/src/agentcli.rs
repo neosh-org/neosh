@@ -417,7 +417,7 @@ async fn start(c: &mut Control, cwd: &std::path::Path, a: &StartArgs) -> anyhow:
     }
 
     if let Some(text) = &prompt {
-        one(c, &info.id, AgentCommand::Send { text: text.clone() }).await?;
+        one(c, &info.id, AgentCommand::Send { text: text.clone(), images: Vec::new() }).await?;
     }
 
     if a.json {
@@ -486,7 +486,7 @@ async fn send(c: &mut Control, a: &SendArgs) -> anyhow::Result<Outcome> {
     if a.wait {
         c.subscribe().await?;
     }
-    one(c, &id, AgentCommand::Send { text }).await?;
+    one(c, &id, AgentCommand::Send { text, images: Vec::new() }).await?;
     if !a.wait {
         return Ok(Outcome(0));
     }

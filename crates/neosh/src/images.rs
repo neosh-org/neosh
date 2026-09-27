@@ -802,6 +802,17 @@ fn keep(store: &Path, bytes: Vec<u8>) -> Result<Attachment, String> {
     Ok(Attachment { path, media_type, width: w, height: h, bytes: len })
 }
 
+/// Keep bytes that arrived some other way — another machine's paste, sent over the swarm — exactly
+/// as a picture read off a file here is kept.
+pub fn from_bytes(store: &Path, bytes: Vec<u8>) -> Result<Attachment, String> {
+    keep(store, bytes)
+}
+
+/// What the bytes say they are, when they are something a provider takes.
+pub fn media_type_of(bytes: &[u8]) -> Option<&'static str> {
+    sniff(bytes)
+}
+
 /// Bring a picture down to something worth sending: inside [`MAX_EDGE`], inside [`MAX_BYTES`], and
 /// in a format a provider accepts.
 ///

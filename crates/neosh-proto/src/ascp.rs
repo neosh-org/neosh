@@ -42,8 +42,8 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::agent::{
-    Capability, Message, PermissionDecision, PermissionMode, PermissionOption, QuestionAnswer,
-    StopReason, ToolCall, ToolResult, Usage, UserQuestion,
+    Capability, ImageFile, Message, PermissionDecision, PermissionMode, PermissionOption,
+    QuestionAnswer, StopReason, ToolCall, ToolResult, Usage, UserQuestion,
 };
 use crate::ids::SessionId;
 use crate::provider::{Activity, CredentialInfo, ModelEntry, OptionSelection};
@@ -274,6 +274,27 @@ pub struct AgentSummary {
     pub updated_at: i64,
     #[serde(default)]
     pub usage: Usage,
+    /// A turn ended and nobody has looked since — the amber row. Looking from another machine
+    /// counts: a watcher's subscription is somebody reading, and opening the conversation from
+    /// anywhere clears it everywhere, because it is one conversation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unread: bool,
+    /// The last turn was cut off by the workspace stopping — the red row.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupted: bool,
+    /// How many things the agent left running between turns — the `○` row.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub background: u32,
+    /// What the owner's own panel wears on this conversation's row — every
+    /// `sidebar.decoration` contribution whose target is this conversation, as data, so the row
+    /// over here wears the same marks with nobody on this machine having to know what they mean.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(type = "Array<unknown>")]
+    pub decorations: Vec<serde_json::Value>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// What a node can be asked to do with an agent it owns.
@@ -287,7 +308,21 @@ pub struct AgentSummary {
 pub enum AgentCommand {
     /// Say something to the agent. While a turn is running this steers it, exactly as typing here
     /// would: the message is held and taken in at the next gap.
-    Send { text: String },
+    Send {
+        text: String,
+        /// Pictures that came with it, as bytes — never as a path, which would name a file on the
+        /// sender's disk and be read by the owner as whatever happened to be at that path on its
+        /// own. Only to a node whose [`NodeCapabilities::live`] is set: an older one drops the
+        /// field without a word, and a picture that silently did not arrive is worse than being
+        /// told it will not.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageData>,
+    },
+    /// Send the picture at `path` as a [`StreamEvent::Image`] — one the conversation's own
+    /// transcript names, and nothing else: the path is the owner's, and a watcher asking for any
+    /// other would be reading that machine's disk through a conversation. Only to a node whose
+    /// [`NodeCapabilities::live`] is set.
+    Picture { path: String },
     /// Ask the turn to stop. The conversation survives it.
     Interrupt,
     /// Answer a permission prompt.
@@ -402,6 +437,15 @@ pub struct RemoteProject {
     /// remote one should not have to say less.
     #[serde(default)]
     pub running: u32,
+    /// What the owner's own panel wears on this project's row — its git stats, its pull request,
+    /// and whatever else a plugin over there decorates it with — as the `sidebar.decoration`
+    /// contributions themselves. Data rather than a description of a repository, so a row over
+    /// here says exactly what the row over there says: `↓3 ~1 #86 ✗2` is a `git status` and a `gh`
+    /// call on *that* disk, with *that* machine's credentials, and a fetch spinner that is
+    /// spinning because *that* machine is fetching.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(type = "Array<unknown>")]
+    pub decorations: Vec<serde_json::Value>,
 }
 
 /// What a node is willing to have done to it.
@@ -471,6 +515,15 @@ pub struct NodeCapabilities {
     /// somebody about to choose from it.
     #[serde(default)]
     pub catalogue: bool,
+    /// Whether this node sends — and reads — a watched conversation **as it stands**: the turn in
+    /// flight on [`StreamEvent::History`] ([`LiveTurn`]), and [`StreamEvent::Notice`] for what the
+    /// owner's own screen said about it in a corner. Without the first, a conversation opened in
+    /// the middle of a turn showed the question and nothing under it until the turn was over;
+    /// without the second, an error that stopped a turn over there was a toast on a screen nobody
+    /// was looking at. A compatibility flag in `browse`'s sense: `Notice` is a tag an older node
+    /// cannot parse, and `false` is what an older handshake decodes to.
+    #[serde(default)]
+    pub live: bool,
     /// The checkouts this node has, for starting something on it.
     #[serde(default)]
     pub projects: Vec<RemoteProject>,
@@ -489,7 +542,19 @@ pub enum StreamEvent {
     ///
     /// A subscriber that only received deltas would show an empty conversation until the next token
     /// arrived, which for an idle agent is never.
-    History { messages: Vec<Message> },
+    History {
+        messages: Vec<Message>,
+        /// The turn running now, as far as it has got — which the messages do not hold yet: an
+        /// agent driver commits nothing until its whole loop is over, so a history taken mid-turn
+        /// is the question and nothing under it. `None` is an idle conversation, from a node whose
+        /// [`NodeCapabilities::live`] is set; from an older one it means only "not said".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        live: Option<LiveTurn>,
+        /// The owner's `SessionInfo::interrupted`: the last turn was cut off by the workspace
+        /// stopping, which the owner's transcript says in a row of its own.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        interrupted: bool,
+    },
     TurnStarted { turn: String },
     Token { turn: String, text: String },
     Thinking { turn: String, text: String },
@@ -508,11 +573,17 @@ pub enum StreamEvent {
     /// Somebody asked the agent something — at that machine's keyboard, from a script, or from a
     /// watcher on another machine — and it is about to be answered or steered in. Without it a
     /// watcher saw answers under questions nobody had shown it. `images` counts the pictures that
-    /// came with it, which do not travel. As [`Self::ToolStarted`].
+    /// came with it; `pictures` says where they are on the owner, so a watcher can ask for them.
+    /// As [`Self::ToolStarted`].
     Asked {
         text: String,
         #[serde(default)]
         images: u32,
+        /// Where those pictures are on the owner, so a watcher can ask for them
+        /// ([`AgentCommand::Picture`]) and draw the question as it was asked. From a node whose
+        /// [`NodeCapabilities::live`] is set.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pictures: Vec<ImageFile>,
     },
     /// The agent asked a question and is waiting for an answer — offered to whoever is watching as
     /// well as to the owner's own screen, and settled by whichever answers first
@@ -536,9 +607,70 @@ pub enum StreamEvent {
     /// is not waiting any more. A watcher takes its panel down: a prompt still on screen after it
     /// was answered is a key that answers nothing. As [`Self::ToolStarted`].
     Settled { id: String },
+    /// What the owner's own screen said about this conversation in a corner — a provider error
+    /// mid-stream is the one that matters. Only to a subscriber whose [`NodeCapabilities::live`]
+    /// is set.
+    Notice { level: crate::MessageLevel, text: String },
+    /// A picture the transcript names, sent because a watcher asked for it
+    /// ([`AgentCommand::Picture`]): a path on the owner is nothing a watcher can open, and a
+    /// transcript with a screenshot in it drew the screenshot's *name* on every machine but one.
+    /// Only to a subscriber whose [`NodeCapabilities::live`] is set.
+    Image {
+        /// The owner's path — what the transcript names, and so what the watcher files it under.
+        path: String,
+        media_type: String,
+        /// Base64.
+        data: String,
+    },
+}
+
+/// A picture on the wire: bytes, as a JSON string can hold them.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct ImageData {
+    pub media_type: String,
+    /// Base64.
+    pub data: String,
+}
+
+/// A turn in flight, as its owner has drawn it so far. See [`StreamEvent::History`].
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[ts(export)]
+pub struct LiveTurn {
+    pub turn: String,
+    /// Seconds since the epoch, when it began — so the working line's clock over here reads what
+    /// the one over there does rather than starting from the moment somebody looked.
+    #[ts(type = "number")]
+    pub started_at: i64,
+    /// What it has said and run, in order, that the conversation's messages do not hold yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub said: Vec<LiveSaid>,
+    /// The agent's own checklist, as of its last report.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan: Vec<crate::PlanStep>,
+}
+
+/// One thing a turn in flight has produced. The two shapes a transcript draws from a round.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum LiveSaid {
+    Text {
+        text: String,
+    },
+    Tool {
+        call: ToolCall,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<ToolResult>,
+    },
 }
 
 impl StreamEvent {
+    /// Whether this is one of the events only a [`NodeCapabilities::live`] subscriber reads.
+    pub fn needs_live(&self) -> bool {
+        matches!(self, Self::Notice { .. } | Self::Image { .. })
+    }
+
     /// Whether this is one of the events only a [`NodeCapabilities::rich_stream`] subscriber reads.
     pub fn is_rich(&self) -> bool {
         matches!(

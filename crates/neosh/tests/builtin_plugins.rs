@@ -10198,6 +10198,10 @@ fn there(session: &str, label: &str, key: &str, cwd: &str, root: &str, branch: O
         turn_started_at: None,
         updated_at: now_secs(),
         usage: Default::default(),
+        unread: false,
+        interrupted: false,
+        background: 0,
+        decorations: Vec::new(),
     }
 }
 
@@ -10213,6 +10217,7 @@ fn theirs(key: &str, name: &str, cwd: &str, root: &str, branch: Option<&str>) ->
         active: false,
         sessions: 0,
         running: 0,
+        decorations: Vec::new(),
     }
 }
 
@@ -10687,6 +10692,7 @@ fn a_workspace_refuses_a_shell_from_a_peer_that_asks_anyway() {
                 shells: true,
                 rich_stream: false,
                 catalogue: false,
+                live: false,
                 projects: Vec::new(),
             };
             neosh_swarm::accept(&mut stream, &theirs, &allowed, &info, &caps).await.expect("paired");
@@ -11299,6 +11305,8 @@ fn another_computers_conversation_opens_as_one_you_can_talk_to() {
             said(Role::User, "what is in here?"),
             said(Role::Assistant, "a parser and a flaky test"),
         ],
+        live: None,
+        interrupted: false,
     });
     assert!(
         s.pump(|s| s.chat_now().iter().any(|l| l.contains("a parser and a flaky test"))),
@@ -11319,7 +11327,10 @@ fn another_computers_conversation_opens_as_one_you_can_talk_to() {
     });
     let neosh_swarm::SwarmEvent::Command { command, session, .. } = asked else { unreachable!() };
     assert_eq!(session.0, "r1");
-    assert_eq!(command, neosh_proto::AgentCommand::Send { text: "run the tests".into() });
+    assert_eq!(command, neosh_proto::AgentCommand::Send {
+        text: "run the tests".into(),
+        images: Vec::new(),
+    });
 
     // And what that machine's agent does with it is drawn as a turn here would be.
     let call = neosh_proto::ToolCall {
@@ -11328,7 +11339,7 @@ fn another_computers_conversation_opens_as_one_you_can_talk_to() {
         name: "Bash".into(),
         input: serde_json::json!({ "command": "cargo test" }),
     };
-    peer.stream("r1", StreamEvent::Asked { text: "run the tests".into(), images: 0 });
+    peer.stream("r1", StreamEvent::Asked { text: "run the tests".into(), images: 0, pictures: Vec::new() });
     peer.stream("r1", StreamEvent::TurnStarted { turn: "t1".into() });
     peer.stream("r1", StreamEvent::ToolStarted { turn: "t1".into(), call: call.clone() });
     peer.stream("r1", StreamEvent::ToolFinished {
@@ -11403,6 +11414,8 @@ fn opened_over_there_with(
             content: vec![neosh_proto::ContentBlock::Text { text: "ready when you are".into() }],
             at: None,
         }],
+        live: None,
+        interrupted: false,
     });
     assert!(
         s.pump(|s| s.chat_now().iter().any(|l| l.contains("ready when you are"))),
@@ -11424,7 +11437,438 @@ fn opening_another_computers_conversation_puts_the_keyboard_in_it() {
     s.special("enter");
     let sent = peer.wait_event("the message", |e| matches!(e, neosh_swarm::SwarmEvent::Command { .. }));
     let neosh_swarm::SwarmEvent::Command { command, .. } = sent else { unreachable!() };
-    assert_eq!(command, neosh_proto::AgentCommand::Send { text: "hello there".into() });
+    assert_eq!(command, neosh_proto::AgentCommand::Send {
+        text: "hello there".into(),
+        images: Vec::new(),
+    });
+}
+
+/// A turn over there ends here with the rows it ends with there.
+///
+/// Every turn's end used to rebuild the transcript from the history the owner sends back, and a
+/// rebuild is the messages and nothing else: the plan the turn closed with, what it changed and what
+/// it left running were drawn by the live path and then taken straight back off the screen — so a
+/// conversation watched from another machine said less than the same conversation on its own.
+#[test]
+fn a_turn_over_there_ends_with_the_rows_it_ends_with_there() {
+    use neosh_proto::{ContentBlock, Message, Role, StreamEvent};
+    let sb = Sandbox::new("swarm-mirror-ending");
+    let (mut s, peer) = opened_over_there(&sb, Shells::default());
+    peer.stream("r1", StreamEvent::Asked { text: "make a plan".into(), images: 0, pictures: Vec::new() });
+    peer.stream("r1", StreamEvent::TurnStarted { turn: "t1".into() });
+    peer.stream("r1", StreamEvent::Activity {
+        turn: "t1".into(),
+        activity: neosh_proto::Activity::Plan {
+            steps: vec![neosh_proto::PlanStep {
+                text: "sharpen the pencils".into(),
+                state: neosh_proto::PlanState::Done,
+            }],
+        },
+    });
+    peer.stream("r1", StreamEvent::Token { turn: "t1".into(), text: "planned it".into() });
+    peer.stream("r1", StreamEvent::TurnEnded {
+        turn: "t1".into(),
+        stop_reason: neosh_proto::StopReason::EndTurn,
+        usage: Default::default(),
+    });
+    assert!(
+        s.pump(|s| {
+            let chat = s.chat_now();
+            chat.iter().any(|l| l.contains("planned it"))
+                && chat.iter().any(|l| l.contains("sharpen the pencils"))
+        }),
+        "the answer and the plan it closed with:\n{:?}",
+        s.chat_now()
+    );
+    // The history the turn's end brings, which is what the owner sends on the re-subscribe — and
+    // then a notice, so there is something to wait on that is known to have come after it.
+    let said = |role: Role, text: &str| Message {
+        role,
+        content: vec![ContentBlock::Text { text: text.into() }],
+        at: None,
+    };
+    peer.stream("r1", StreamEvent::History {
+        messages: vec![
+            said(Role::Assistant, "ready when you are"),
+            said(Role::User, "make a plan"),
+            said(Role::Assistant, "planned it"),
+        ],
+        live: None,
+        interrupted: false,
+    });
+    peer.stream("r1", StreamEvent::Notice {
+        level: neosh_proto::MessageLevel::Info,
+        text: "history landed".into(),
+    });
+    // Said with the machine it came from.
+    s.wait_for("linux-box: history landed");
+    assert!(
+        s.chat_now().iter().any(|l| l.contains("sharpen the pencils")),
+        "the plan is still under the answer:\n{:?}",
+        s.chat_now()
+    );
+}
+
+/// A conversation opened in the middle of a turn over there shows the turn as far as it has got.
+///
+/// An agent driver commits nothing until its whole loop is over, so the history a machine sent a
+/// watcher mid-turn was the question and nothing under it — no tool calls, no words, no working
+/// line — for as long as the turn went on.
+#[test]
+fn another_computers_conversation_opened_mid_turn_shows_the_turn_so_far() {
+    use neosh_proto::{ContentBlock, Message, Role, StreamEvent};
+    const KEY: &str = "git:github.com/neoswarm/faraway";
+    let sb = Sandbox::new("swarm-mirror-midturn");
+    sb.git_init();
+    let mut peer = Peer::beside(&sb, "linux-box");
+    let mut busy = there("r1", "over there", KEY, "/srv/faraway", "/srv/faraway", Some("main"));
+    busy.state = neosh_proto::AgentState::Running;
+    peer.publish(vec![theirs(KEY, "faraway", "/srv/faraway", "/srv/faraway", Some("main"))], vec![
+        busy,
+    ]);
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("over there"))),
+        "their conversation arrives:\n{:?}",
+        s.sidebar_now()
+    );
+    let theirs_id = peer.handle.id().0.clone();
+    s.send(&format!(r#"{{"type":"command","name":"swarm.open","args":["{theirs_id}","r1"]}}"#));
+    peer.wait_event("a subscription", |e| {
+        matches!(e, neosh_swarm::SwarmEvent::Subscribed { session, .. } if session.0 == "r1")
+    });
+    let call = neosh_proto::ToolCall {
+        id: neosh_proto::ToolCallId("c1".into()),
+        turn: neosh_proto::TurnId("t1".into()),
+        name: "Bash".into(),
+        input: serde_json::json!({ "command": "cargo build" }),
+    };
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+        - 90;
+    peer.stream("r1", StreamEvent::History {
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: "build it please".into() }],
+            at: None,
+        }],
+        live: Some(neosh_proto::LiveTurn {
+            turn: "t1".into(),
+            started_at: started,
+            said: vec![
+                neosh_proto::LiveSaid::Text { text: "halfway there".into() },
+                neosh_proto::LiveSaid::Tool {
+                    call,
+                    result: Some(neosh_proto::ToolResult::ok("Finished dev profile")),
+                },
+            ],
+            plan: Vec::new(),
+        }),
+        interrupted: false,
+    });
+    assert!(
+        s.pump(|s| {
+            let chat = s.chat_now();
+            chat.iter().any(|l| l.contains("build it please"))
+                && chat.iter().any(|l| l.contains("halfway there"))
+                && chat.iter().any(|l| l.contains("cargo build"))
+        }),
+        "the question, what was said and the call it ran:\n{:?}",
+        s.chat_now()
+    );
+    // And the rest of it arrives under what was already there.
+    peer.stream("r1", StreamEvent::Token { turn: "t1".into(), text: "and it builds".into() });
+    peer.stream("r1", StreamEvent::TurnEnded {
+        turn: "t1".into(),
+        stop_reason: neosh_proto::StopReason::EndTurn,
+        usage: Default::default(),
+    });
+    assert!(
+        s.pump(|s| {
+            let chat = s.chat_now();
+            let half = chat.iter().position(|l| l.contains("halfway there"));
+            let rest = chat.iter().position(|l| l.contains("and it builds"));
+            matches!((half, rest), (Some(a), Some(b)) if a < b)
+        }),
+        "the end of the turn is under its start:\n{:?}",
+        s.chat_now()
+    );
+}
+
+/// Another machine's rows say what its own panel says: that a turn finished unread, that one is
+/// waiting on a question, and the marks its plugins put on a project — its git stats and its pull
+/// request, read on that disk with that machine's credentials.
+#[test]
+fn another_computers_rows_say_what_its_panel_says() {
+    const KEY: &str = "git:github.com/neoswarm/faraway";
+    let sb = Sandbox::new("swarm-rows-say");
+    sb.git_init();
+    let peer = Peer::beside(&sb, "linux-box");
+    let mut done = there("r1", "done one", KEY, "/srv/faraway", "/srv/faraway", Some("main"));
+    done.unread = true;
+    let mut asks = there("r2", "asks one", KEY, "/srv/faraway", "/srv/faraway", Some("main"));
+    asks.state = neosh_proto::AgentState::Blocked;
+    let mut project = theirs(KEY, "faraway", "/srv/faraway", "/srv/faraway", Some("main"));
+    project.decorations = vec![serde_json::json!({
+        "target": { "project": "/srv/faraway" },
+        "badge": { "parts": [{ "text": "\u{2193}3", "hl": "Git.Behind" }, { "text": " " }, { "text": "#86", "hl": "Forge.Open" }] },
+    })];
+    peer.publish(vec![project], vec![done, asks]);
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    let row = |s: &Session, needle: &str| -> Option<(String, Vec<String>)> {
+        let rows = s.sidebar_now();
+        let groups = s.buffer_named("[sidebar]").map(|b| s.groups_of(b)).unwrap_or_default();
+        let i = rows.iter().position(|l| l.contains(needle))?;
+        Some((rows[i].clone(), groups.get(i).cloned().unwrap_or_default()))
+    };
+    assert!(
+        s.pump(|s| row(s, "done one")
+            .is_some_and(|(_, g)| g.iter().any(|g| g == "Status.Unread"))),
+        "a turn nobody has read is amber, as one of yours is:\n{:?}\n{:?}",
+        s.sidebar_now(),
+        row(&s, "done one")
+    );
+    assert!(
+        s.pump(|s| row(s, "asks one")
+            .is_some_and(|(t, g)| t.contains('?') && g.iter().any(|g| g == "Status.Pending"))),
+        "one waiting on a question says so:\n{:?}\n{:?}",
+        s.sidebar_now(),
+        row(&s, "asks one")
+    );
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("faraway") && l.contains("#86"))),
+        "the project wears the marks its own panel gives it:\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+/// What this machine's panel wears on a project is what it advertises: another machine's row for it
+/// is drawn from the very contributions drawn here, so a checkout with an untracked file in it says
+/// `?1` on both screens without the other one running `git` against a disk it cannot see.
+#[test]
+fn a_projects_marks_go_to_the_machines_watching_it() {
+    let sb = Sandbox::new("swarm-marks-out");
+    sb.git_init();
+    std::fs::write(sb.work().join("stray.txt"), "untracked").expect("a stray file");
+    let mut peer = Peer::beside(&sb, "linux-box");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let marked = loop {
+        assert!(std::time::Instant::now() < deadline, "the project never arrived with its marks");
+        let Some(event) = peer.events.blocking_recv() else { panic!("the peer stopped") };
+        if let neosh_swarm::SwarmEvent::PeerUp { capabilities, .. } = event
+            && let Some(p) = capabilities.projects.iter().find(|p| !p.decorations.is_empty())
+        {
+            break p.decorations.clone();
+        }
+    };
+    let said = serde_json::to_string(&marked).expect("json");
+    assert!(said.contains("?1"), "the untracked count, as the panel here draws it: {said}");
+}
+
+/// A tiny real PNG, so what crosses the wire is decoded and kept for real.
+fn png_bytes() -> Vec<u8> {
+    let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([7, 8, 9, 255]));
+    let mut bytes = Vec::new();
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .expect("encode");
+    bytes
+}
+
+/// A picture in another machine's conversation is drawn here, not named.
+///
+/// The transcript names a picture by its path, and a path over there is nothing this machine can
+/// open — so a screenshot somebody pasted, or one the agent read, was the picture on one screen and
+/// its file name on every other. The watcher asks for the ones it has not got, and the owner sends
+/// only what the conversation shows.
+#[test]
+fn another_computers_pictures_are_drawn_here() {
+    use base64::Engine as _;
+    use neosh_proto::{ContentBlock, Message, Role, StreamEvent};
+    let sb = Sandbox::new("swarm-mirror-pictures");
+    let (mut s, mut peer) = opened_over_there(&sb, Shells::default());
+    peer.stream("r1", StreamEvent::History {
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Image { path: "/srv/shots/screen.png".into(), media_type: "image/png".into() },
+                ContentBlock::Text { text: "what is this".into() },
+            ],
+            at: None,
+        }],
+        live: None,
+        interrupted: false,
+    });
+    let asked = peer.wait_event("the picture asked for", |e| {
+        matches!(
+            e,
+            neosh_swarm::SwarmEvent::Command { command: neosh_proto::AgentCommand::Picture { .. }, .. }
+        )
+    });
+    let neosh_swarm::SwarmEvent::Command { command, .. } = asked else { unreachable!() };
+    assert_eq!(command, neosh_proto::AgentCommand::Picture { path: "/srv/shots/screen.png".into() });
+    peer.stream("r1", StreamEvent::Image {
+        path: "/srv/shots/screen.png".into(),
+        media_type: "image/png".into(),
+        data: base64::engine::general_purpose::STANDARD.encode(png_bytes()),
+    });
+    assert!(
+        s.pump(|s| s.wire().contains("images/remote/")),
+        "the picture is drawn from the copy here:\n{:?}",
+        s.chat_now()
+    );
+}
+
+/// A picture pasted into another machine's conversation goes with the words, as bytes.
+///
+/// It used to stay behind with a warning — `pictures stay on this computer` — so the one question
+/// that most needed its screenshot was asked without it.
+#[test]
+fn a_picture_sent_to_another_computer_goes_with_the_words() {
+    use base64::Engine as _;
+    let sb = Sandbox::new("swarm-mirror-send-picture");
+    let (mut s, mut peer) = opened_over_there(&sb, Shells::default());
+    let shot = sb.root.join("work/shot.png");
+    std::fs::write(&shot, png_bytes()).expect("write");
+    s.send(&serde_json::json!({"type": "paste", "text": shot.display().to_string()}).to_string());
+    s.type_text("what is this");
+    s.special("enter");
+    let sent = peer.wait_event("the message", |e| matches!(e, neosh_swarm::SwarmEvent::Command { .. }));
+    let neosh_swarm::SwarmEvent::Command {
+        command: neosh_proto::AgentCommand::Send { text, images },
+        ..
+    } = sent
+    else {
+        panic!("a message");
+    };
+    assert_eq!(text, "what is this");
+    assert_eq!(images.len(), 1, "the picture went with it");
+    assert_eq!(images[0].media_type, "image/png");
+    let bytes = base64::engine::general_purpose::STANDARD.decode(&images[0].data).expect("base64");
+    assert_eq!(bytes, png_bytes(), "the picture itself, not a path to it");
+}
+
+/// This machine sends a watcher the pictures its conversation shows — and nothing else on its disk.
+///
+/// The path in a request is a file here, and a watcher that could name any file it liked would be
+/// reading this machine through a conversation. So the request is answered only for a picture the
+/// transcript itself names.
+#[test]
+fn a_watcher_gets_the_pictures_a_conversation_shows_and_no_other_file() {
+    let sb = Sandbox::new("swarm-pictures-out");
+    sb.git_init();
+    let shot = sb.root.join("work/shot.png");
+    std::fs::write(&shot, png_bytes()).expect("write");
+    let mut peer = Peer::beside(&sb, "linux-box");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.send(&serde_json::json!({"type": "paste", "text": shot.display().to_string()}).to_string());
+    s.type_text("what is this");
+    s.special("enter");
+
+    // The conversation, once the roster says it has something in it.
+    let (me, session) = loop {
+        let e = peer.wait_event("the conversation", |e| {
+            matches!(e, neosh_swarm::SwarmEvent::Inventory { agents, .. }
+                if agents.iter().any(|a| a.message_count > 0))
+        });
+        let neosh_swarm::SwarmEvent::Inventory { node, agents, .. } = e else { unreachable!() };
+        if let Some(a) = agents.iter().find(|a| a.message_count > 0) {
+            break (node, a.session.clone());
+        }
+    };
+    peer.handle.send(neosh_swarm::SwarmRequest::Subscribe { node: me.clone(), session: session.clone() });
+    let history = peer.wait_event("the history", |e| {
+        matches!(e, neosh_swarm::SwarmEvent::Stream {
+            event: neosh_proto::StreamEvent::History { .. }, ..
+        })
+    });
+    let neosh_swarm::SwarmEvent::Stream {
+        event: neosh_proto::StreamEvent::History { messages, .. },
+        ..
+    } = history
+    else {
+        unreachable!()
+    };
+    let path = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|b| match b {
+            neosh_proto::ContentBlock::Image { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .expect("the question carries its picture");
+
+    let ask = |id: &str, path: &str| neosh_swarm::SwarmRequest::Command {
+        node: me.clone(),
+        id: id.into(),
+        session: session.clone(),
+        command: neosh_proto::AgentCommand::Picture { path: path.into() },
+    };
+    peer.handle.send(ask("p1", &path));
+    let sent = peer.wait_event("the picture", |e| {
+        matches!(e, neosh_swarm::SwarmEvent::Stream {
+            event: neosh_proto::StreamEvent::Image { .. }, ..
+        })
+    });
+    let neosh_swarm::SwarmEvent::Stream {
+        event: neosh_proto::StreamEvent::Image { path: said, media_type, .. },
+        ..
+    } = sent
+    else {
+        unreachable!()
+    };
+    assert_eq!(said, path);
+    assert_eq!(media_type, "image/png");
+
+    let elsewhere = sb.root.join("work/secret.png");
+    std::fs::write(&elsewhere, png_bytes()).expect("write");
+    peer.handle.send(ask("p2", &elsewhere.display().to_string()));
+    let refused = peer.wait_event("the refusal", |e| {
+        matches!(e, neosh_swarm::SwarmEvent::Answer { id, .. } if id == "p2")
+    });
+    let neosh_swarm::SwarmEvent::Answer { result, .. } = refused else { unreachable!() };
+    assert!(
+        matches!(result, Err(neosh_proto::Refusal::NotPermitted { .. })),
+        "a file the conversation does not show is not sent: {result:?}"
+    );
+}
+
+/// A turn over there that finishes with nobody watching it anywhere is news here, as one of yours
+/// would be — and a conversation that stops to ask something is news too.
+#[test]
+fn another_computers_turn_ending_unwatched_is_a_notification_here() {
+    const KEY: &str = "git:github.com/neoswarm/faraway";
+    let sb = Sandbox::new("swarm-remote-alert");
+    sb.git_init();
+    let peer = Peer::beside(&sb, "linux-box");
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+        - 600;
+    let mut busy = there("r1", "long job", KEY, "/srv/faraway", "/srv/faraway", Some("main"));
+    busy.state = neosh_proto::AgentState::Running;
+    busy.turn_started_at = Some(started);
+    let project = || theirs(KEY, "faraway", "/srv/faraway", "/srv/faraway", Some("main"));
+    peer.publish(vec![project()], vec![busy.clone()]);
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("long job"))),
+        "the running conversation arrives:\n{:?}",
+        s.sidebar_now()
+    );
+    let mut done = busy.clone();
+    done.state = neosh_proto::AgentState::Idle;
+    done.unread = true;
+    peer.publish(vec![project()], vec![done]);
+    s.wait_for("finished on linux-box");
 }
 
 /// A question the agent over there asks is asked here, and answered from here.
@@ -11514,7 +11958,6 @@ fn an_answer_to_nothing_is_refused() {
         matches!(&result, Err(neosh_proto::Refusal::Failed { message }) if message.contains("already")),
         "refused by name: {result:?}"
     );
-    drop(s);
 }
 
 /// Another machine's conversation shows *that* machine's models: in the footer, in `^P`, and in

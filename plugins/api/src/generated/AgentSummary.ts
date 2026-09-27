@@ -91,4 +91,24 @@ export type AgentSummary = {
   turn_started_at?: number | null;
   updated_at: number;
   usage: Usage;
+  /**
+   * A turn ended and nobody has looked since — the amber row. Looking from another machine
+   * counts: a watcher's subscription is somebody reading, and opening the conversation from
+   * anywhere clears it everywhere, because it is one conversation.
+   */
+  unread?: boolean;
+  /**
+   * The last turn was cut off by the workspace stopping — the red row.
+   */
+  interrupted?: boolean;
+  /**
+   * How many things the agent left running between turns — the `○` row.
+   */
+  background?: number;
+  /**
+   * What the owner's own panel wears on this conversation's row — every
+   * `sidebar.decoration` contribution whose target is this conversation, as data, so the row
+   * over here wears the same marks with nobody on this machine having to know what they mean.
+   */
+  decorations?: Array<unknown>;
 };

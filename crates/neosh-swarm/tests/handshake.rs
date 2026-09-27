@@ -23,6 +23,7 @@ fn caps() -> NodeCapabilities {
         browse: true,
         rich_stream: true,
         catalogue: true,
+        live: true,
         projects: Vec::new(),
     }
 }

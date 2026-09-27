@@ -76,6 +76,16 @@ export type NodeCapabilities = {
    */
   catalogue: boolean;
   /**
+   * Whether this node sends — and reads — a watched conversation **as it stands**: the turn in
+   * flight on [`StreamEvent::History`] ([`LiveTurn`]), and [`StreamEvent::Notice`] for what the
+   * owner's own screen said about it in a corner. Without the first, a conversation opened in
+   * the middle of a turn showed the question and nothing under it until the turn was over;
+   * without the second, an error that stopped a turn over there was a toast on a screen nobody
+   * was looking at. A compatibility flag in `browse`'s sense: `Notice` is a tag an older node
+   * cannot parse, and `false` is what an older handshake decodes to.
+   */
+  live: boolean;
+  /**
    * The checkouts this node has, for starting something on it.
    */
   projects: Array<RemoteProject>;

@@ -59,4 +59,13 @@ export type RemoteProject = {
    * remote one should not have to say less.
    */
   running: number;
+  /**
+   * What the owner's own panel wears on this project's row — its git stats, its pull request,
+   * and whatever else a plugin over there decorates it with — as the `sidebar.decoration`
+   * contributions themselves. Data rather than a description of a repository, so a row over
+   * here says exactly what the row over there says: `↓3 ~1 #86 ✗2` is a `git status` and a `gh`
+   * call on *that* disk, with *that* machine's credentials, and a fetch spinner that is
+   * spinning because *that* machine is fetching.
+   */
+  decorations?: Array<unknown>;
 };

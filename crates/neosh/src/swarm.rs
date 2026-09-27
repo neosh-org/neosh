@@ -97,6 +97,7 @@ impl Swarm {
                 shells: false,
                 rich_stream: false,
                 catalogue: false,
+                live: false,
                 projects: Vec::new(),
             },
             agents: Vec::new(),
@@ -283,6 +284,117 @@ pub fn summarise(
         turn_started_at: info.turn_started_at,
         updated_at: info.updated_at,
         usage: info.usage.clone(),
+        unread: info.unread,
+        interrupted: info.interrupted,
+        background: info.background.len() as u32,
+        // The host's to fill: they are contributions, and this knows nothing of the registry.
+        decorations: Vec::new(),
+    }
+}
+
+/// How much of a frame a conversation's history may take. Under the swarm's
+/// eight-megabyte frame cap with room for the envelope around it, because a frame over
+/// the cap is not refused, it is the *connection* failing — every conversation on that link, and
+/// again on every reconnect, since opening the conversation is what sends it.
+pub const HISTORY_BUDGET: usize = 6 * 1024 * 1024;
+
+/// A conversation's history cut down to fit in one frame, if it has to be.
+///
+/// What goes first is what a transcript folds anyway: the middles of long tool outputs, reasoning,
+/// and the long strings inside a call's arguments — a file written whole is a diff card over there,
+/// and the card shows a few lines of it. Only if that is not enough do the oldest turns go, whole,
+/// because the newest one is the one somebody opened this to read. What was said is never clipped.
+pub fn fit_history(
+    mut messages: Vec<neosh_proto::Message>,
+    mut live: Option<neosh_proto::LiveTurn>,
+) -> (Vec<neosh_proto::Message>, Option<neosh_proto::LiveTurn>) {
+    use neosh_proto::ContentBlock as B;
+    let size_of = |m: &neosh_proto::Message| serde_json::to_vec(m).map_or(0, |v| v.len() + 1);
+    let live_size = |l: &Option<neosh_proto::LiveTurn>| {
+        l.as_ref().and_then(|l| serde_json::to_vec(l).ok()).map_or(0, |v| v.len())
+    };
+    let total = |m: &[neosh_proto::Message], l: &Option<neosh_proto::LiveTurn>| {
+        m.iter().map(size_of).sum::<usize>() + live_size(l)
+    };
+    if total(&messages, &live) <= HISTORY_BUDGET {
+        return (messages, live);
+    }
+    for cap in [64 * 1024, 16 * 1024, 4 * 1024, 1024] {
+        for m in &mut messages {
+            for b in &mut m.content {
+                match b {
+                    B::ToolResult { content, .. } => clip_middle(content, cap),
+                    B::Thinking { text, .. } => clip_middle(text, cap),
+                    B::ToolUse { input, .. } => clip_json(input, cap),
+                    B::Text { .. } | B::Image { .. } => {}
+                }
+            }
+        }
+        if let Some(l) = live.as_mut() {
+            for item in &mut l.said {
+                if let neosh_proto::LiveSaid::Tool { call, result } = item {
+                    clip_json(&mut call.input, cap);
+                    if let Some(r) = result {
+                        clip_middle(&mut r.content, cap);
+                    }
+                }
+            }
+        }
+        if total(&messages, &live) <= HISTORY_BUDGET {
+            return (messages, live);
+        }
+    }
+    // Whole turns off the front. A turn starts where somebody said something, so a tool result is
+    // never left behind without the call it answers.
+    let opens = |m: &neosh_proto::Message| {
+        m.role == neosh_proto::Role::User
+            && m.content.iter().any(|b| matches!(b, B::Text { .. } | B::Image { .. }))
+    };
+    let sizes: Vec<usize> = messages.iter().map(size_of).collect();
+    let mut sum: usize = sizes.iter().sum::<usize>() + live_size(&live);
+    let mut cut = 0;
+    while sum > HISTORY_BUDGET && cut + 1 < messages.len() {
+        sum -= sizes[cut];
+        cut += 1;
+        while cut + 1 < messages.len() && !opens(&messages[cut]) {
+            sum -= sizes[cut];
+            cut += 1;
+        }
+    }
+    messages.drain(..cut);
+    (messages, live)
+}
+
+/// `text` with its middle taken out when it is longer than `cap` bytes: the head is how it started
+/// and the tail is what it decided, which is how a card folds it anyway.
+fn clip_middle(text: &mut String, cap: usize) {
+    if text.len() <= cap {
+        return;
+    }
+    let half = cap / 2;
+    let mut head = half;
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = text.len() - half;
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    let gone = tail - head;
+    *text = format!(
+        "{}\n… {gone} bytes not sent from the other computer …\n{}",
+        &text[..head],
+        &text[tail..]
+    );
+}
+
+/// Every string inside a call's arguments, clipped the same way.
+fn clip_json(value: &mut serde_json::Value, cap: usize) {
+    match value {
+        serde_json::Value::String(s) => clip_middle(s, cap),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|v| clip_json(v, cap)),
+        serde_json::Value::Object(map) => map.values_mut().for_each(|v| clip_json(v, cap)),
+        _ => {}
     }
 }
 
@@ -298,6 +410,69 @@ fn state_of(info: &SessionInfo) -> AgentState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn said(role: neosh_proto::Role, block: neosh_proto::ContentBlock) -> neosh_proto::Message {
+        neosh_proto::Message { role, content: vec![block], at: None }
+    }
+
+    fn question(text: &str) -> neosh_proto::Message {
+        said(neosh_proto::Role::User, neosh_proto::ContentBlock::Text { text: text.into() })
+    }
+
+    fn output(n: usize) -> neosh_proto::Message {
+        said(neosh_proto::Role::User, neosh_proto::ContentBlock::ToolResult {
+            tool_use_id: neosh_proto::ToolCallId("t".into()),
+            content: "x".repeat(n),
+            is_error: false,
+            images: Vec::new(),
+        })
+    }
+
+    fn size(messages: &[neosh_proto::Message]) -> usize {
+        serde_json::to_vec(messages).map_or(0, |v| v.len())
+    }
+
+    /// A conversation that fits goes as it is.
+    #[test]
+    fn a_history_that_fits_is_left_alone() {
+        let messages = vec![question("hello"), output(1000)];
+        let (out, _) = fit_history(messages.clone(), None);
+        assert_eq!(out, messages);
+    }
+
+    /// One enormous command output is clipped from the middle rather than dropping the link — or
+    /// the conversation.
+    #[test]
+    fn a_huge_tool_output_is_clipped_from_the_middle() {
+        let messages = vec![question("build it"), output(HISTORY_BUDGET * 2)];
+        let (out, _) = fit_history(messages, None);
+        assert!(size(&out) <= HISTORY_BUDGET);
+        assert_eq!(out.len(), 2, "nothing dropped, only clipped");
+        let neosh_proto::ContentBlock::ToolResult { content, .. } = &out[1].content[0] else {
+            panic!("still a result");
+        };
+        assert!(content.contains("bytes not sent"), "says so");
+    }
+
+    /// When clipping is not enough the oldest turns go, whole, and the newest stays.
+    #[test]
+    fn the_oldest_turns_go_first_and_whole() {
+        let mut messages = Vec::new();
+        for i in 0..4000 {
+            messages.push(question(&format!("question {i} {}", "y".repeat(2000))));
+            messages.push(output(10));
+        }
+        let (out, _) = fit_history(messages, None);
+        assert!(size(&out) <= HISTORY_BUDGET);
+        let neosh_proto::ContentBlock::Text { text } = &out[0].content[0] else {
+            panic!("starts at a question, not an orphaned result");
+        };
+        assert!(text.starts_with("question"));
+        let neosh_proto::ContentBlock::Text { text } = &out[out.len() - 2].content[0] else {
+            panic!("the newest question is kept");
+        };
+        assert!(text.starts_with("question 3999"));
+    }
 
     fn node(id: &str, name: &str) -> NodeInfo {
         NodeInfo {
@@ -317,6 +492,7 @@ mod tests {
             shells: false,
             rich_stream: true,
             catalogue: true,
+            live: true,
             projects: Vec::new(),
         }
     }
@@ -341,6 +517,10 @@ mod tests {
             turn_started_at: None,
             updated_at: updated,
             usage: Default::default(),
+            unread: false,
+            interrupted: false,
+            background: 0,
+            decorations: Vec::new(),
         }
     }
 

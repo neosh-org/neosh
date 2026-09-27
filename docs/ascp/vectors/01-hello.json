@@ -4,6 +4,7 @@
     "accepts_commands": true,
     "browse": true,
     "catalogue": false,
+    "live": false,
     "projects": [
       {
         "active": true,

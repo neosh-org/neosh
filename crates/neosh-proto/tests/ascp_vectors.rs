@@ -80,6 +80,7 @@ fn caps() -> NodeCapabilities {
         browse: true,
         rich_stream: false,
         catalogue: false,
+        live: false,
         projects: vec![RemoteProject {
             key: ProjectKey("git:github.com/neoswarm/neosh".into()),
             name: "neosh".into(),
@@ -90,6 +91,7 @@ fn caps() -> NodeCapabilities {
             active: true,
             sessions: 2,
             running: 1,
+            decorations: Vec::new(),
         }],
     }
 }
@@ -114,6 +116,10 @@ fn agent() -> AgentSummary {
         turn_started_at: Some(1_770_000_000),
         updated_at: 1_770_000_042,
         usage: Usage::default(),
+        unread: false,
+        interrupted: false,
+        background: 0,
+        decorations: Vec::new(),
     }
 }
 
@@ -181,7 +187,7 @@ fn every_message_has_a_canonical_encoding() {
         canonical(&AscpMessage::Command {
             id: "c1".into(),
             session: SessionId("01J8XPQ4".into()),
-            command: AgentCommand::Send { text: "try the other approach".into() },
+            command: AgentCommand::Send { text: "try the other approach".into(), images: Vec::new() },
         }),
     );
     check(

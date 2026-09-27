@@ -626,7 +626,7 @@ async fn run_client(cli: &Cli, paths: &Paths, cwd: &std::path::Path) -> anyhow::
             control
                 .call(neosh_proto::ApiCall::AgentCommand {
                     session: Some(info.id.clone()),
-                    command: neosh_proto::AgentCommand::Send { text },
+                    command: neosh_proto::AgentCommand::Send { text, images: Vec::new() },
                 })
                 .await?;
             Some(info.id)
