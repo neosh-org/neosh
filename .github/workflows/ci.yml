@@ -15,11 +15,16 @@ name: CI
 on:
   push:
     branches: [main]
-    # A change that no stage reads is a run that proves nothing. If a required check is ever
-    # configured on this repository, this has to go: a check that never reports blocks the merge.
+    # A change that no stage reads is a run that proves nothing — on `main`, where nothing waits on
+    # the answer.
     paths-ignore: ["**.md", "website/**"]
+  # Not filtered, and it cannot be: `CI passed` is a required check, and a check that never reports
+  # on a docs-only pull request is a pull request the merge queue can never take.
   pull_request:
-    paths-ignore: ["**.md", "website/**"]
+  # The merge queue builds each group on top of `main` and waits for `CI passed` on that, which is
+  # what makes it a queue rather than a merge button: two pull requests green on their own and
+  # broken together are caught before `main` is.
+  merge_group:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -107,3 +112,16 @@ jobs:
         with:
           node-version: 22
       - run: ./scripts/check.sh web
+
+  # The one check the merge queue requires. One name rather than eight, so a stage added, sliced or
+  # renamed changes this list and not the repository's ruleset — and `always()`, so a failure or a
+  # cancellation above is reported as a failure here rather than as a check that never ran.
+  passed:
+    name: CI passed
+    if: always()
+    needs: [crates, binary, screen, web]
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo '${{ toJSON(needs) }}'
+          [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}" = "false" ]
