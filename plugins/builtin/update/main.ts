@@ -239,6 +239,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       askedAt = Date.now();
       if (!s) return neosh.notify("Could not check for updates", "warn");
       await draw(s);
+      if (s.method === "development") return neosh.notify(development(s), "warn");
       if (s.error) return neosh.notify(`Update check failed: ${s.error}`, "warn");
       if (!s.behind) return neosh.notify(`neosh ${s.current} is the newest`, "info");
       return neosh.cmd.exec(`${NS}.apply`);
@@ -256,6 +257,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
           "info",
         );
       }
+      if (s.method === "development") return neosh.notify(development(s), "warn");
       if (s.error) return neosh.notify(`Update check failed: ${s.error}`, "warn");
       if (!s.behind) return neosh.notify(`neosh ${s.current} is the newest`, "info");
       return neosh.notify(`neosh ${s.latest} is available`, "info");
@@ -427,4 +429,35 @@ async function declareOptions(neosh: Neosh) {
     default: DEFAULT_INTERVAL_S,
     description: "Seconds between checks for a newer neosh. 0 never asks.",
   }).catch(() => {});
+}
+
+/**
+ * What a development build answers `/update` with.
+ *
+ * It used to say "neosh 0.4.11 is the newest", because a checkout is never offered an update — and
+ * a `target/debug/neosh` left serving a workspace is exactly what plain `neosh` attaches to
+ * afterwards, so a person with 0.5.0 installed was told they had the newest while running last
+ * week's build. The host's sentence, with the same facts: which build, what is released, what to do.
+ */
+function development(s: UpdateStatus): string {
+  if (s.latest && newer(s.latest, s.current)) {
+    return `Development build ${s.current} — neosh ${s.latest} is released. ` +
+      "Rebuild, or `neosh stop` and run the installed release.";
+  }
+  return s.latest
+    ? `Development build ${s.current}, the newest release — rebuild from your checkout to update it.`
+    : `Development build ${s.current} — rebuild from your checkout to update it.`;
+}
+
+/** Whether `a` is a later version than `b`, by numbered parts; anything unparseable is not. */
+function newer(a: string, b: string): boolean {
+  const parts = (v: string) => v.replace(/^v/, "").split(".").map((p) => Number(p));
+  const x = parts(a);
+  const y = parts(b);
+  if ([...x, ...y].some((n) => !Number.isInteger(n))) return false;
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    const d = (x[i] ?? 0) - (y[i] ?? 0);
+    if (d !== 0) return d > 0;
+  }
+  return false;
 }

@@ -128,6 +128,21 @@ pub fn install_method(exe: &Path) -> InstallMethod {
 /// Not a string compare: `0.10.0` sorts before `0.9.0` as text, which would tell everybody running
 /// 0.10 to downgrade. Anything unparseable compares as absent rather than as zero, so a tag nobody
 /// anticipated cannot manufacture an update.
+/// What a development build says when asked to update: which build it is, what is released, and
+/// the two ways forward — because neither is something neosh can do to a binary cargo owns.
+pub fn development_sentence(current: &str, latest: Option<&str>) -> String {
+    match latest {
+        Some(v) if is_newer(v, current) => format!(
+            "development build {current} — neosh {v} is released. Rebuild, or `neosh stop` and run \
+             the installed release"
+        ),
+        Some(_) => format!(
+            "development build {current}, the newest release — rebuild from your checkout to update it"
+        ),
+        None => format!("development build {current} — rebuild from your checkout to update it"),
+    }
+}
+
 fn is_newer(latest: &str, current: &str) -> bool {
     fn parts(v: &str) -> Option<Vec<u64>> {
         // A `-rc.1` suffix makes the last field unparseable, and an unparseable version is one we
@@ -382,15 +397,16 @@ impl Updater {
 
         let mut status = self.blank();
 
-        // A checkout is never told to update. Nothing published is newer than what is about to be
-        // compiled, and a notice about it would fire on every developer's every start.
-        if status.method == InstallMethod::Development {
-            return self.with_local(status).await;
-        }
-
         match fetch_latest().await {
             Ok(tag) => {
-                status.behind = is_newer(&tag, &self.current);
+                // A checkout is never *told* to update — a notice would fire on every developer's
+                // every start, about a binary that is theirs to rebuild — so `behind` stays false.
+                // It is still told what the newest release *is*: "nothing published is newer than
+                // what is about to be compiled" is only true of a checkout that has been pulled,
+                // and a `target/debug/neosh` left serving a workspace for a week answered `/update`
+                // with "0.4.11 is the newest" the morning 0.5.0 came out.
+                status.behind = status.method != InstallMethod::Development
+                    && is_newer(&tag, &self.current);
                 status.latest = Some(tag.trim_start_matches('v').to_string());
             }
             // Kept rather than swallowed: a failed check that reads as "up to date" is a machine
@@ -436,6 +452,11 @@ impl Updater {
         let status = self.check(true, false).await;
         let method = status.method;
 
+        // Nothing here can replace a binary cargo builds, and "up to date" would be the one wrong
+        // answer: it is what a checkout left behind main was told. Said with what to do instead.
+        if method == InstallMethod::Development {
+            return UpdateOutcome::Failed { reason: development_sentence(&self.current, status.latest.as_deref()) };
+        }
         // Finish what is already half done before starting anything new. A binary already waiting
         // on disk — ours, or one `brew upgrade` put there — is not a workspace that needs another
         // download, and saying so here rather than only in the plugin means every caller of the API
@@ -1042,6 +1063,23 @@ mod tests {
         assert!(u.stamp.is_none());
         assert!(u.replaced().is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A development build asked to update names what is released instead of calling itself the
+    /// newest — which is what a `target/debug/neosh` left serving a workspace used to answer.
+    #[test]
+    fn a_development_build_says_what_is_released() {
+        let behind = development_sentence("0.4.11", Some("0.5.0"));
+        assert!(behind.contains("development build 0.4.11"), "{behind}");
+        assert!(behind.contains("0.5.0 is released"), "{behind}");
+        assert!(behind.contains("neosh stop"), "{behind}");
+        let level = development_sentence("0.5.0", Some("0.5.0"));
+        assert!(level.contains("the newest release"), "{level}");
+        let offline = development_sentence("0.4.11", None);
+        assert!(
+            !offline.contains("released") && !offline.contains("newest"),
+            "nothing claimed about a release it never saw: {offline}"
+        );
     }
 
     #[test]
