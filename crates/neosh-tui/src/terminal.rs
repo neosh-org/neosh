@@ -12,7 +12,10 @@ use crossterm::event::{
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::cursor::SetCursorStyle;
-use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{
+    BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode,
+};
 use crossterm::{execute, ExecutableCommand};
 use neosh_proto::{InputEvent, KeyCode, KeyMods, KeyPress};
 use ratatui::backend::CrosstermBackend;
@@ -188,6 +191,19 @@ impl TerminalFrontend {
     /// how wide its pane is, and therefore cannot size a meter, decide what to drop at 60 columns,
     /// or page by a screenful — all of which are the frontend's knowledge, not the core's.
     pub fn draw(&mut self, mirror: &Mirror) -> io::Result<Vec<crate::Geometry>> {
+        // One synchronized update per frame. ratatui hides the cursor while it paints and the
+        // caret is shown again only at the end, so a terminal that renders mid-frame catches it
+        // hidden — at the 20 fps a spinner redraws, that is a caret blinking twenty times a
+        // second. Terminals without mode 2026 ignore both escapes.
+        self.terminal.backend_mut().execute(BeginSynchronizedUpdate)?;
+        let frame = self.draw_frame(mirror);
+        let end = self.terminal.backend_mut().execute(EndSynchronizedUpdate);
+        let geometry = frame?;
+        end?;
+        Ok(geometry)
+    }
+
+    fn draw_frame(&mut self, mirror: &Mirror) -> io::Result<Vec<crate::Geometry>> {
         self.theme.sync(&mirror.highlights);
         let theme = self.theme.clone();
         let mut drawn = render::Drawn::default();
